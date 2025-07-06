@@ -10,20 +10,13 @@
 
 import torch
 import torch.nn as nn
+from models.networks.resnet.wideresnet import WideResNet
+
+# TODO if a vae works well, try a vit 
 
 # --- PLACEHOLDER: A standard WideResNet implementation ---
 # You can find PyTorch implementations of WideResNet in many public repos.
 # The CausalDiff paper points to a specific one you can adapt.
-class WideResNet(nn.Module):
-    def __init__(self, depth, widen_factor, num_classes):
-        super(WideResNet, self).__init__()
-        # ... full WideResNet implementation ...
-        self.output_dim = 640 # Example for WRN-28-10
-
-    def forward(self, x):
-        # ... forward pass ...
-        # Return the final feature vector before the classification layer
-        return out
 
 class CausalEncoder(nn.Module):
     """
@@ -33,8 +26,11 @@ class CausalEncoder(nn.Module):
     def __init__(self, backbone_arch, s_dim, z_dim):
         super().__init__()
         # TO-DO: Instantiate the backbone.
-        self.backbone = WideResNet(depth=28, widen_factor=10, num_classes=10) # Example
-        backbone_out_dim = self.backbone.output_dim
+        if backbone_arch == 'WRN':
+            self.backbone = WideResNet(depth=28, num_classes=10, widen_factor=10) # Example
+            backbone_out_dim = self.backbone.output_dim
+        else:
+            raise ValueError(f"Unsupported backbone architecture: {backbone_arch}")
 
         # ### VAE-style Heads ###
         # Instead of directly outputting s and z, we output the parameters of a
