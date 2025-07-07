@@ -12,30 +12,20 @@ import torch
 import torch.nn as nn
 from models.networks.resnet.wideresnet import WideResNet
 
-# TODO if a vae works well, try a vit 
-
-# --- PLACEHOLDER: A standard WideResNet implementation ---
-# You can find PyTorch implementations of WideResNet in many public repos.
-# The CausalDiff paper points to a specific one you can adapt.
+# TODO: Try ViT backbone if VAE works well
 
 class CausalEncoder(nn.Module):
     """
     Encodes an image x into latent factors s and z using a VAE-style approach.
-    This allows us to calculate the KL-divergence term in the CIB loss.
     """
-    def __init__(self, backbone_arch, s_dim, z_dim):
+    def __init__(self, backbone_arch, s_dim, z_dim, wrn_depth=28, wrn_widen_factor=10):
         super().__init__()
-        # TO-DO: Instantiate the backbone.
         if backbone_arch == 'WRN':
-            self.backbone = WideResNet(depth=28, num_classes=10, widen_factor=10) # Example
-            backbone_out_dim = self.backbone.output_dim
+            self.backbone = WideResNet(depth=wrn_depth, num_classes=10, widen_factor=wrn_widen_factor)
+            backbone_out_dim = self.backbone.fc.in_features
+            self.backbone.fc = nn.Identity()
         else:
             raise ValueError(f"Unsupported backbone architecture: {backbone_arch}")
-
-        # ### VAE-style Heads ###
-        # Instead of directly outputting s and z, we output the parameters of a
-        # Gaussian distribution for each. This is what allows us to calculate
-        # the KL divergence loss (the "information bottleneck").
         self.fc_mu_s = nn.Linear(backbone_out_dim, s_dim)
         self.fc_logvar_s = nn.Linear(backbone_out_dim, s_dim)
         self.fc_mu_z = nn.Linear(backbone_out_dim, z_dim)

@@ -209,3 +209,6 @@ __marimo__/
 context.txt
 *.pdf
 context/
+
+cifar-10-batches-py/
+*.gz

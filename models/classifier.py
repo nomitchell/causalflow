@@ -12,8 +12,7 @@ class LatentClassifier(nn.Module):
     """Classifies a label Y from the latent causal factor s."""
     def __init__(self, s_dim, num_classes, hidden_dim_factor=2):
         super().__init__()
-        # TO-DO: Define a simple MLP. The exact architecture is a hyperparameter
-        # that can be tuned, but a simple two-layer network is a good start.
+        # Simple two-layer MLP (tunable hyperparameters)
         self.classifier = nn.Sequential(
             nn.Linear(s_dim, s_dim * hidden_dim_factor),
             nn.ReLU(),

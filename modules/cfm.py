@@ -6,27 +6,29 @@
 # WHERE TO GET CODE: The logic is directly from the FlowPure paper's methodology
 # and can be adapted from its official implementation.
 
-import torch
+'''
+some improvements could be with source distribution, noise to data
+increase sigma
+'''
 
-class ConditionalFlowMatcher:
+import torch
+import torch.nn as nn
+
+class ConditionalFlowMatcher(nn.Module):
     def __init__(self, sigma: float = 0.0):
+        super().__init__()
         self.sigma = sigma
 
     def sample_source(self, x: torch.Tensor) -> torch.Tensor:
-        # For simplicity, we sample another image from the same batch to act as the source.
-        # In a real implementation, `x_source` could also be pure noise.
+        # Sample another image from the batch as the source (could also use noise)
         return x[torch.randperm(x.shape[0], device=x.device)]
 
     def forward(self, x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x_clean = x_clean.float()
         x_source = self.sample_source(x_clean)
         t = torch.rand(x_clean.shape[0], device=x_clean.device).view(-1, 1, 1, 1)
-
-        # The straight-line path (rectified flow)
         x_t = (1 - t) * x_source + t * x_clean
         if self.sigma > 0:
             x_t += torch.randn_like(x_t) * self.sigma
-
-        # The target velocity is simply the difference vector.
         u_t = x_clean - x_source
         return t.squeeze(), x_t, u_t

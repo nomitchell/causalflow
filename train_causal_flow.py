@@ -5,97 +5,146 @@
 
 import torch
 import torch.nn.functional as F
-from models.unet import Unet
+import yaml # Using YAML for configs is best practice
+from pathlib import Path
+from tqdm import tqdm
+
+# --- Model and Module Imports ---
+from models.causalunet import UNetModel # Assuming the modified UNetModel is here
 from models.encoder import CausalEncoder
 from models.classifier import LatentClassifier
 from modules.cfm import ConditionalFlowMatcher
 from modules.cib import CIBLoss
+from data.cifar10 import get_cifar10_loaders
+
+# --- Helper function for device management ---
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def main():
-    # --- 1. Initialization ---
-    # TO-DO: Load all hyperparameters from a YAML config file.
+    # --- 1. Configuration ---
+    # It's best practice to load hyperparameters from a separate config file.
     # This makes experiments repeatable and easy to track.
+    # For now, we define it as a dictionary.
     config = {
-        's_dim': 128, 'z_dim': 128, 'num_classes': 10, 'lr': 1e-4,
-        'pretrain_epochs': 50, 'main_train_epochs': 200, 'sigma': 0.01,
-        'lambda_kl': 1e-2, 'gamma_ce': 1e-2, 'eta_club': 1e-5
+        'image_size': 32,
+        'in_channels': 3,
+        'model_channels': 128,
+        'out_channels': 3,
+        'num_res_blocks': 2,
+        'attention_resolutions': "16,8",
+        's_dim': 128,
+        'z_dim': 128,
+        'num_classes': 10,
+        'lr': 1e-4,
+        'batch_size': 64,
+        'pretrain_epochs': 50,
+        'main_train_epochs': 200,
+        'sigma': 0.01,
+        'lambda_kl': 1e-2,
+        'gamma_ce': 1e-2,
+        'eta_club': 1e-5,
+        'wrn_depth': 28,
+        'wrn_widen_factor': 10,
     }
 
-    # TO-DO: Instantiate all models.
-    # The architectures can be copied/adapted from the source repos.
-    unet = Unet(in_channel=3, s_dim=config['s_dim'], z_dim=config['z_dim'])
-    encoder = CausalEncoder(backbone_arch='WRN-70-16', s_dim=config['s_dim'], z_dim=config['z_dim'])
-    classifier = LatentClassifier(s_dim=config['s_dim'], num_classes=config['num_classes'])
+    # --- 2. Setup (Device, Data, Models) ---
+    device = get_device()
+    print(f"Using device: {device}")
 
-    # These are our new/hybrid modules
-    cib_loss_fn = CIBLoss(lambda_kl=config['lambda_kl'], gamma_ce=config['gamma_ce'], eta_club=config['eta_club'])
+    # Data Loaders
+    train_loader, test_loader = get_cifar10_loaders(batch_size=config['batch_size'])
+
+    # Model Instantiation and moving them to the correct device
+    attention_resolutions = [int(res) for res in config['attention_resolutions'].split(',')]
+    unet = UNetModel(
+        image_size=config['image_size'], in_channels=config['in_channels'],
+        model_channels=config['model_channels'], out_channels=config['out_channels'],
+        num_res_blocks=config['num_res_blocks'], attention_resolutions=attention_resolutions,
+        s_dim=config['s_dim'], z_dim=config['z_dim']
+    ).to(device)
+
+    encoder = CausalEncoder(
+        backbone_arch='WRN', s_dim=config['s_dim'], z_dim=config['z_dim'],
+        wrn_depth=config['wrn_depth'], wrn_widen_factor=config['wrn_widen_factor']
+    ).to(device)
+
+    classifier = LatentClassifier(s_dim=config['s_dim'], num_classes=config['num_classes']).to(device)
+
+    # Loss and Flow Matcher Instantiation
+    cib_loss_fn = CIBLoss(
+        lambda_kl=config['lambda_kl'], gamma_ce=config['gamma_ce'],
+        eta_club=config['eta_club'], s_dim=config['s_dim'], z_dim=config['z_dim']
+    ).to(device) # The CIB loss also has parameters (the CLUB estimator) that need to be on the GPU
+
     flow_matcher = ConditionalFlowMatcher(sigma=config['sigma'])
 
-    # TO-DO: Set up the optimizer. CRITICAL: It must manage the parameters of ALL THREE models.
+    # Optimizer for all models
     optimizer = torch.optim.Adam(
-        list(unet.parameters()) + list(encoder.parameters()) + list(classifier.parameters()),
+        list(unet.parameters()) + list(encoder.parameters()) +
+        list(classifier.parameters()) + list(cib_loss_fn.parameters()), # Include loss parameters
         lr=config['lr']
     )
 
-    # Placeholder for the dataloader
-    dataloader = torch.utils.data.DataLoader(...)
+    # Create directories for saving models
+    Path("checkpoints").mkdir(exist_ok=True)
 
-    # --- 2. Training Loop ---
-    # This follows the two-stage curriculum from CausalDiff.
-
-    # ### STAGE 1: Pre-training (Adapted from CausalDiff's Algorithm 2) ###
-    # GOAL: Get the U-Net and Encoder to a good starting point for reconstruction.
+    # --- 3. Stage 1: Pre-training (Reconstruction) ---
     print("--- Starting Stage 1: Pre-training for Reconstruction ---")
     for epoch in range(config['pretrain_epochs']):
-        for i, (x_clean, y) in enumerate(dataloader):
+        for i, (x_clean, y) in tqdm(enumerate(train_loader)):
+            x_clean = x_clean.to(device)
             optimizer.zero_grad()
-
-            # The core Flow Matching step. Code can be copied from FlowPure's training script.
+            
             t, xt, ut = flow_matcher(x_clean)
-
-            # Get latent factors from the encoder
-            s, z, _, _ = encoder(x_clean) # Assuming VAE-style encoder for now
-
-            # Predict the velocity field (noise)
+            # Encoder must also run on the correct device
+            s, z, _, _ = encoder(x_clean)
+            
             predicted_ut = unet(xt, t, s, z)
-
-            # In pre-training, we ONLY use the reconstruction loss.
+            
             loss = F.mse_loss(predicted_ut, ut)
             loss.backward()
             optimizer.step()
 
-    # ### STAGE 2: Joint Training (Adapted from CausalDiff's Algorithm 1) ###
-    # GOAL: Train the full system with the CIB loss to achieve disentanglement.
+            if i % 100 == 0:
+                print(f"[Pre-train Epoch {epoch+1}/{config['pretrain_epochs']}] [Batch {i}/{len(train_loader)}] Loss: {loss.item():.4f}")
+
+    print("Pre-training complete. Saving pre-trained models.")
+    torch.save(unet.state_dict(), "checkpoints/unet_pretrained.pt")
+    torch.save(encoder.state_dict(), "checkpoints/encoder_pretrained.pt")
+
+
+    # --- 4. Stage 2: Joint Training (Full CIB Loss) ---
     print("--- Starting Stage 2: Joint Training with CIB Loss ---")
     for epoch in range(config['main_train_epochs']):
-        for i, (x_clean, y) in enumerate(dataloader):
+        for i, (x_clean, y) in tqdm(enumerate(train_loader)):
+            x_clean, y = x_clean.to(device), y.to(device)
             optimizer.zero_grad()
 
-            # --- CausalFlow Logic ---
-            # 1. Encode the clean image to get S and Z.
-            s, z, mu, logvar = encoder(x_clean) # VAE encoder needed for KL divergence
-
-            # 2. Get the flow-matched samples (same as pre-training).
+            s, z, s_params, z_params = encoder(x_clean)
             t, xt, ut = flow_matcher(x_clean)
-
-            # 3. Predict velocity using the *conditional* U-Net.
             predicted_ut = unet(xt, t, s, z)
-
-            # 4. Get the class prediction from the S factor.
             logits = classifier(s)
-
-            # ### HARD RESEARCH AREA 2: Loss Balancing ###
-            # The CIB loss function is the heart of the causal model.
-            # Getting these weights right is critical and will require significant experimentation.
-            # The values in the CausalDiff paper are a starting point, but they will
-            # likely need to be re-tuned for our flow-based model.
-            loss, loss_dict = cib_loss_fn(predicted_ut, ut, logits, y, s, z, mu, logvar)
-            # --- End Hard Research Area ---
-
+            
+            # The full CIB loss calculation
+            loss, loss_dict = cib_loss_fn(predicted_ut, ut, logits, y, s, z, s_params, z_params)
+            
             loss.backward()
             optimizer.step()
-            # TO-DO: Add logging (e.g., using TensorBoard or W&B) to track all components
-            # of `loss_dict`. This is essential for debugging and tuning.
+
+            if i % 100 == 0:
+                # Basic logging to console
+                log_str = f"[Main Epoch {epoch+1}/{config['main_train_epochs']}] [Batch {i}/{len(train_loader)}] Total Loss: {loss.item():.4f}"
+                for k, v in loss_dict.items():
+                    log_str += f" | {k}: {v:.4f}"
+                print(log_str)
+                # TODO: Replace print with a proper logger like TensorBoard or W&B
+
+    print("Main training complete. Saving final models.")
+    torch.save(unet.state_dict(), "checkpoints/unet_final.pt")
+    torch.save(encoder.state_dict(), "checkpoints/encoder_final.pt")
+    torch.save(classifier.state_dict(), "checkpoints/classifier_final.pt")
+
 
 if __name__ == "__main__":
     main()
