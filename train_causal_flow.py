@@ -43,9 +43,10 @@ def main():
         'sigma': 0.01,
         'lambda_kl': 1e-2,
         'gamma_ce': 1e-2,
-        'eta_club': 1e-5,
+        'eta_club': 1e-6, # maybe 7
         'wrn_depth': 28,
         'wrn_widen_factor': 10,
+        'use_pretrained': True,
     }
 
     # --- 2. Setup (Device, Data, Models) ---
@@ -91,28 +92,31 @@ def main():
 
     # --- 3. Stage 1: Pre-training (Reconstruction) ---
     print("--- Starting Stage 1: Pre-training for Reconstruction ---")
-    for epoch in range(config['pretrain_epochs']):
-        for i, (x_clean, y) in tqdm(enumerate(train_loader)):
-            x_clean = x_clean.to(device)
-            optimizer.zero_grad()
-            
-            t, xt, ut = flow_matcher(x_clean)
-            # Encoder must also run on the correct device
-            s, z, _, _ = encoder(x_clean)
-            
-            predicted_ut = unet(xt, t, s, z)
-            
-            loss = F.mse_loss(predicted_ut, ut)
-            loss.backward()
-            optimizer.step()
+    if config.get("use_pretrained", False):
+        for epoch in range(config['pretrain_epochs']):
+            for i, (x_clean, y) in tqdm(enumerate(train_loader)):
+                x_clean = x_clean.to(device)
+                optimizer.zero_grad()
+                
+                t, xt, ut = flow_matcher(x_clean)
+                # Encoder must also run on the correct device
+                s, z, _, _ = encoder(x_clean)
+                
+                predicted_ut = unet(xt, t, s, z)
+                
+                loss = F.mse_loss(predicted_ut, ut)
+                loss.backward()
+                optimizer.step()
 
-            if i % 100 == 0:
-                print(f"[Pre-train Epoch {epoch+1}/{config['pretrain_epochs']}] [Batch {i}/{len(train_loader)}] Loss: {loss.item():.4f}")
-
-    print("Pre-training complete. Saving pre-trained models.")
-    torch.save(unet.state_dict(), "checkpoints/unet_pretrained.pt")
-    torch.save(encoder.state_dict(), "checkpoints/encoder_pretrained.pt")
-
+                if i % 100 == 0:
+                    print(f"[Pre-train Epoch {epoch+1}/{config['pretrain_epochs']}] [Batch {i}/{len(train_loader)}] Loss: {loss.item():.4f}")
+        print("Pre-training complete. Saving pre-trained models.")
+        torch.save(unet.state_dict(), "checkpoints/unet_pretrained.pt")
+        torch.save(encoder.state_dict(), "checkpoints/encoder_pretrained.pt")
+    else:
+        print("Loading pretrained models from checkpoints for Stage 2...")
+        unet.load_state_dict(torch.load("checkpoints/unet_pretrained.pt", map_location=device))
+        encoder.load_state_dict(torch.load("checkpoints/encoder_pretrained.pt", map_location=device))
 
     # --- 4. Stage 2: Joint Training (Full CIB Loss) ---
     print("--- Starting Stage 2: Joint Training with CIB Loss ---")
