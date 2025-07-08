@@ -31,4 +31,4 @@ class ConditionalFlowMatcher(nn.Module):
         if self.sigma > 0:
             x_t += torch.randn_like(x_t) * self.sigma
         u_t = x_clean - x_source
-        return t.squeeze(), x_t, u_t
+        return t.squeeze(-1), x_t, u_t # is -1 the right option here?

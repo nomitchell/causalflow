@@ -9,6 +9,8 @@ import yaml # Using YAML for configs is best practice
 from pathlib import Path
 from tqdm import tqdm
 
+pretrained = True
+
 # --- Model and Module Imports ---
 from models.causalunet import UNetModel # Assuming the modified UNetModel is here
 from models.encoder import CausalEncoder
@@ -37,7 +39,7 @@ def main():
         'z_dim': 128,
         'num_classes': 10,
         'lr': 1e-4,
-        'batch_size': 64,
+        'batch_size': 1,
         'pretrain_epochs': 50,
         'main_train_epochs': 200,
         'sigma': 0.01,
@@ -46,7 +48,6 @@ def main():
         'eta_club': 1e-6, # maybe 7
         'wrn_depth': 28,
         'wrn_widen_factor': 10,
-        'use_pretrained': True,
     }
 
     # --- 2. Setup (Device, Data, Models) ---
@@ -92,7 +93,7 @@ def main():
 
     # --- 3. Stage 1: Pre-training (Reconstruction) ---
     print("--- Starting Stage 1: Pre-training for Reconstruction ---")
-    if config.get("use_pretrained", False):
+    if not pretrained:
         for epoch in range(config['pretrain_epochs']):
             for i, (x_clean, y) in tqdm(enumerate(train_loader)):
                 x_clean = x_clean.to(device)
