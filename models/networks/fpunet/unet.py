@@ -235,8 +235,6 @@ class ResBlock(TimestepBlock):
         )
 
     def _forward(self, x, emb):
-        print("To start, x.shape:", x.shape)
-        print("To start, emb.shape:", emb.shape)
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -246,15 +244,10 @@ class ResBlock(TimestepBlock):
         else:
             h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
-
-        print("After in_layers, h.shape:", h.shape)
-        print("After in_layers, emb_out.shape:", emb_out.shape)
         
         # Properly reshape emb_out to match h's spatial dimensions
         if len(emb_out.shape) == 2:
             emb_out = emb_out.view(emb_out.shape[0], emb_out.shape[1], *([1] * (len(h.shape) - 2)))
-
-        print("After emb_layers, emb_out.shape:", emb_out.shape)
         
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]

@@ -26,9 +26,17 @@ class ConditionalFlowMatcher(nn.Module):
     def forward(self, x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x_clean = x_clean.float()
         x_source = self.sample_source(x_clean)
-        t = torch.rand(x_clean.shape[0], device=x_clean.device).view(-1, 1, 1, 1)
-        x_t = (1 - t) * x_source + t * x_clean
+        
+        # Create a 1D tensor for t
+        t = torch.rand(x_clean.shape[0], device=x_clean.device)
+        
+        # Create a broadcastable version of t for interpolation
+        t_broadcast = t.view(-1, 1, 1, 1)
+        
+        x_t = (1 - t_broadcast) * x_source + t_broadcast * x_clean
         if self.sigma > 0:
             x_t += torch.randn_like(x_t) * self.sigma
         u_t = x_clean - x_source
-        return t.squeeze(-1), x_t, u_t # is -1 the right option here?
+        
+        # Return the 1D t tensor
+        return t, x_t, u_t

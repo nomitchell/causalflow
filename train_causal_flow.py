@@ -39,7 +39,7 @@ def main():
         'z_dim': 128,
         'num_classes': 10,
         'lr': 1e-4,
-        'batch_size': 1,
+        'batch_size': 64,
         'pretrain_epochs': 50,
         'main_train_epochs': 200,
         'sigma': 0.01,

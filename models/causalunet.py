@@ -277,7 +277,6 @@ class UNetModel(nn.Module):
         # --- This is the key modification ---
         # If s and z are provided, project them and add them to the embedding.
         # This injects the causal information at the very beginning of the network.
-        print("emb here is", emb.shape)
         if s is not None:
             emb = emb + self.s_proj(s)
         if z is not None:
