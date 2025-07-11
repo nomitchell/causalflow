@@ -32,14 +32,15 @@ class CLUB(nn.Module):
 
 class CIBLoss(nn.Module):
     """Causal Information Bottleneck loss."""
-    def __init__(self, lambda_kl, gamma_ce, eta_club, s_dim, z_dim):
+    def __init__(self, lambda_kl, gamma_ce, eta_club, s_dim, z_dim, alpha_recon=1.0):
         super().__init__()
         self.lambda_kl = lambda_kl
         self.gamma_ce = gamma_ce
         self.eta_club = eta_club
         self.club_estimator = CLUB(s_dim, z_dim)
+        self.alpha_recon = alpha_recon
 
-    def forward(self, predicted_ut, target_ut, logits, target_labels, s, z, s_dist_params, z_dist_params):
+    def forward(self, predicted_ut, target_ut, logits, target_labels, s, z, s_dist_params, z_dist_params, include_recon=True):
         reconstruction_loss = F.mse_loss(predicted_ut, target_ut)
         prediction_loss = F.cross_entropy(logits, target_labels)
         disentanglement_loss = self.club_estimator(s, z)
@@ -48,10 +49,21 @@ class CIBLoss(nn.Module):
         kl_s = -0.5 * torch.sum(1 + logvar_s - mu_s.pow(2) - logvar_s.exp(), dim=1).mean()
         kl_z = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp(), dim=1).mean()
         kl_loss = kl_s + kl_z
-        total_loss = (reconstruction_loss +
+        total_loss = (self.alpha_recon * reconstruction_loss +
                       self.gamma_ce * prediction_loss +
                       self.eta_club * disentanglement_loss +
                       self.lambda_kl * kl_loss)
+
+        if include_recon:
+            total_loss = (self.alpha_recon * reconstruction_loss +
+                          self.gamma_ce * prediction_loss +
+                          self.eta_club * disentanglement_loss +
+                          self.lambda_kl * kl_loss)
+        else:
+            total_loss = (self.gamma_ce * prediction_loss +
+                          self.eta_club * disentanglement_loss +
+                          self.lambda_kl * kl_loss)
+        
         return total_loss, {
             "reconstruction_loss": reconstruction_loss.item(),
             "prediction_loss": prediction_loss.item(),

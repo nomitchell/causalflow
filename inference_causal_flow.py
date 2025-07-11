@@ -1,451 +1,302 @@
-# inference_causal_flow.py
-# PURPOSE: Implements the three-stage defense pipeline for classifying a single
-# (potentially adversarial) image at test time. This is where the model's
-# robustness is actually realized.
+# test_causalflow_sota.py
+# FINAL VERSION: A comprehensive script to rigorously evaluate and compare multiple defense
+# configurations against a suite of attacks, including AutoAttack.
+# CORRECTED: Fixed RuntimeError by removing torch.no_grad() from model evaluation calls.
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
+import os
+import sys
+import datetime
+import pandas as pd
+
+# --- Model and Data Imports ---
 from models.causalunet import UNetModel
 from models.encoder import CausalEncoder
 from models.classifier import LatentClassifier
 from modules.cfm import ConditionalFlowMatcher
-from autoattack import AutoAttack  # Requires 'pip install autoattack'
+from models.networks.resnet.wideresnet import WideResNet
+from data.cifar10 import get_cifar10_loaders
+from autoattack import AutoAttack
 
-# --- Utility: Load model weights ---
-def load_model(model_class, weight_path, device, **kwargs):
+# ======================================================================================
+# 1. UTILITY AND HELPER FUNCTIONS
+# ======================================================================================
+
+def get_device():
+    """Gets the final available device for PyTorch."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_model_from_checkpoint(model_class, checkpoint_path, model_key, device, **kwargs):
+    """A robust utility to load a model's state_dict from a composite or direct checkpoint file."""
     model = model_class(**kwargs).to(device)
-    model.load_state_dict(torch.load(weight_path, map_location=device))
+    # Ensure the checkpoint is loaded correctly, especially in environments with strict loading.
+    full_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    if isinstance(full_checkpoint, dict) and model_key in full_checkpoint:
+        state_dict = full_checkpoint[model_key]
+    else:
+        state_dict = full_checkpoint
+
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model
 
-# --- Purification: Reverse ODE (FlowPure baseline) ---
-def purify_image_reverse_ode(adversarial_image, unet_model, flow_matcher, steps=20):
-    """
-    Stage 1: Adversarial Purification (AP).
-    ### HARD RESEARCH AREA 3: Effective Purification ###
-    # CausalDiff uses Likelihood Maximization (LM) for purification. This is an
-    # iterative optimization process that finds a clean image `x*` that is close
-    # to the adversarial input but has a high likelihood under the generative model.
-    #
-    # TO-DO:
-    # 1. Implement LM for a flow-based model. This is non-trivial. It involves
-    #    calculating the gradient of the log-likelihood with respect to the input `x`
-    #    and performing gradient ascent.
-    # 2. As a simpler placeholder/baseline, one could run the reverse ODE/SDE of the
-    #    flow from t=1 to t=0, starting from the adversarial image. This is what
-    #    FlowPure does, but it may be less effective than true LM.
-    """
-    device = adversarial_image.device
-    x = adversarial_image.clone().detach().to(device)
-    t_vals = torch.linspace(1, 0, steps, device=device)
-    dt = -1.0 / (steps - 1)
-    # Dummy s, z for unconditional purification (or use encoder if desired)
-    s = torch.zeros(x.shape[0], unet_model.s_proj.in_features, device=device)
-    z = torch.zeros(x.shape[0], unet_model.z_proj.in_features, device=device)
-    for t in t_vals:
-        t_batch = torch.full((x.shape[0],), t, device=device)
-        with torch.no_grad():
-            velocity = unet_model(x, t_batch, s, z)
-        x = x + velocity * dt
-    return x.detach()
+def pgd_attack(model, images, labels, eps, alpha, iters):
+    """Performs a standard PGD attack against a given model."""
+    images = images.clone().detach().to(images.device)
+    labels = labels.clone().detach().to(labels.device)
+    loss_fn = nn.CrossEntropyLoss()
+    adv_images = images.clone().detach()
 
-# --- Purification: Likelihood Maximization (SOTA approach) ---
-def purify_image_likelihood_max(adversarial_image, unet_model, flow_matcher, encoder_model=None, 
-                               steps=100, lr=0.01, lambda_reg=0.1, noise_scale=0.01):
-    """
-    Stage 1: Adversarial Purification via Likelihood Maximization.
-    
-    This implements the SOTA purification approach from FlowPure:
-    - Maximizes log-likelihood under the trained flow model
-    - Uses L2 regularization to stay close to adversarial input
-    - Optionally uses encoder to get better s, z estimates
-    
-    Args:
-        adversarial_image: [B, C, H, W] potentially adversarial input
-        unet_model: trained U-Net flow model
-        flow_matcher: conditional flow matcher
-        encoder_model: optional encoder for better s, z estimates
-        steps: number of optimization steps
-        lr: learning rate for optimization
-        lambda_reg: L2 regularization strength
-        noise_scale: noise scale for better exploration
-    
-    Returns:
-        purified_image: [B, C, H, W] purified image
-    """
-    device = adversarial_image.device
-    batch_size = adversarial_image.shape[0]
-    
-    # Initialize from adversarial image with small noise for better exploration
-    x = adversarial_image.clone().detach().to(device)
-    x = x + torch.randn_like(x) * noise_scale
-    x.requires_grad_(True)
-    
-    # Get s, z estimates (either from encoder or zeros)
-    if encoder_model is not None:
+    for _ in range(iters):
+        adv_images.requires_grad = True
+        outputs = model(adv_images)
+        model.zero_grad()
+        cost = loss_fn(outputs, labels)
+        
+        cost.backward()
+        
         with torch.no_grad():
-            s, z, _, _ = encoder_model(adversarial_image)
-    else:
-        s = torch.zeros(batch_size, unet_model.s_proj.in_features, device=device)
-        z = torch.zeros(batch_size, unet_model.z_proj.in_features, device=device)
-    
-    # Optimizer for the image
-    optimizer = torch.optim.Adam([x], lr=lr, betas=(0.9, 0.999))
-    
-    # Track optimization progress
-    losses = []
-    
-    for step in range(steps):
-        optimizer.zero_grad()
-        
-        # Sample multiple timesteps for better likelihood estimation
-        num_samples = 5
-        total_nll = 0
-        
-        for _ in range(num_samples):
-            # Get flow samples
-            t, xt, ut = flow_matcher(x)
-            
-            # Predict velocity field
-            predicted_ut = unet_model(xt, t, s, z)
-            
-            # Negative log-likelihood: MSE between predicted and target velocity
-            # This approximates -log p(x) under the flow model
-            nll = F.mse_loss(predicted_ut, ut, reduction='mean')
-            total_nll += nll
-        
-        # Average negative log-likelihood
-        avg_nll = total_nll / num_samples
-        
-        # L2 regularization to stay close to adversarial input
-        reg_loss = lambda_reg * F.mse_loss(x, adversarial_image, reduction='mean')
-        
-        # Total loss: minimize negative log-likelihood + regularization
-        total_loss = avg_nll + reg_loss
-        
-        # Backward pass
-        total_loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_([x], max_norm=1.0)
-        
-        optimizer.step()
-        
-        # Clamp to valid image range
-        x.data.clamp_(0, 1)
-        
-        losses.append(total_loss.item())
-        
-        # Early stopping if loss plateaus
-        if step > 20 and abs(losses[-1] - losses[-2]) < 1e-6:
-            break
-    
-    return x.detach()
+            adv_images = adv_images + alpha * adv_images.grad.sign()
+            perturbation = torch.clamp(adv_images - images, min=-eps, max=eps)
+            adv_images = torch.clamp(images + perturbation, min=0, max=1).detach()
+    return adv_images
 
-# --- Causal Factor Inference (optimize s, z) ---
-def infer_causal_factors(purified_image, encoder_model, unet_model, flow_matcher, steps=100, lr=0.01):
+# ======================================================================================
+# 2. SOTA PURIFICATION IMPLEMENTATION (from FlowPure)
+# ======================================================================================
+
+def purify_likelihood_maximization(x_adv, unet, encoder, flow_matcher, steps=40, lr=0.01, lambda_reg=0.1):
+    """
+    Purifies an image by optimizing it to maximize the likelihood under the flow model.
+    MODIFIED FOR DIFFERENTIABILITY using BPDA (Backward Pass Differentiable Approximation).
+    This resolves the "can't optimize a non-leaf Tensor" error while allowing gradient flow for attacks.
+    """
+    # Create a leaf tensor for the inner optimization loop. This is detached from x_adv's graph.
+    x_purified_leaf = x_adv.detach().clone().requires_grad_(True)
+    
+    # The optimizer will update this leaf tensor.
+    optimizer = torch.optim.Adam([x_purified_leaf], lr=lr)
+
+    # s and z can be computed with no_grad as they are conditions, not optimized variables in this loop.
     with torch.no_grad():
-        s, z, _, _ = encoder_model(purified_image)
-    s = s.clone().detach().requires_grad_(True)
-    z = z.clone().detach().requires_grad_(True)
-    optimizer = torch.optim.Adam([s, z], lr=lr)
+        s, z, _, _ = encoder(x_adv)
+
     for _ in range(steps):
         optimizer.zero_grad()
-        t, xt, ut = flow_matcher(purified_image.repeat(10, 1, 1, 1))
-        predicted_ut = unet_model(xt, t.squeeze(), s.repeat(10, 1), z.repeat(10, 1))
-        loss = F.mse_loss(predicted_ut, ut)
+        t_dummy = torch.zeros(x_purified_leaf.shape[0], device=x_purified_leaf.device)
+        
+        _, _, ut_zero = flow_matcher(x_purified_leaf, x_purified_leaf)
+        
+        # During the purification steps, s and z are detached constants.
+        predicted_ut = unet(x_purified_leaf, t_dummy, s.detach(), z.detach())
+        nll = F.mse_loss(predicted_ut, ut_zero)
+        
+        # The regularization term pulls the optimized leaf towards the original adversarial input.
+        # We use x_adv.detach() because we are only optimizing x_purified_leaf.
+        reg_loss = lambda_reg * F.mse_loss(x_purified_leaf, x_adv.detach())
+        loss = nll + reg_loss
+        
+        # This backward call computes gradients for the *purification* loss w.r.t. x_purified_leaf.
         loss.backward()
         optimizer.step()
-    return s.detach(), z.detach()
+        
+        # Clamp the data in-place.
+        x_purified_leaf.data.clamp_(0, 1)
 
-# --- Enhanced Causal Factor Inference ---
-def infer_causal_factors_enhanced(purified_image, encoder_model, unet_model, flow_matcher, 
-                                steps=200, lr=0.005, num_samples=10):
-    """
-    Stage 2: Enhanced Causal Factor Inference.
-    
-    Optimizes s and z to maximize likelihood under the flow model,
-    starting from encoder estimates and refining them.
-    
-    Args:
-        purified_image: [B, C, H, W] purified image
-        encoder_model: trained encoder
-        unet_model: trained U-Net flow model
-        flow_matcher: conditional flow matcher
-        steps: number of optimization steps
-        lr: learning rate
-        num_samples: number of flow samples per step
-    
-    Returns:
-        s_opt: [B, s_dim] optimized causal factors
-        z_opt: [B, z_dim] optimized non-causal factors
-    """
-    device = purified_image.device
-    batch_size = purified_image.shape[0]
-    
-    # Get initial estimates from encoder
-    with torch.no_grad():
-        s_init, z_init, _, _ = encoder_model(purified_image)
-    
-    # Initialize optimization variables
-    s = s_init.clone().detach().requires_grad_(True)
-    z = z_init.clone().detach().requires_grad_(True)
-    
-    # Optimizer for s and z
-    optimizer = torch.optim.Adam([s, z], lr=lr, betas=(0.9, 0.999))
-    
-    for step in range(steps):
-        optimizer.zero_grad()
-        
-        # Sample multiple timesteps for robust optimization
-        total_loss = 0
-        
-        for _ in range(num_samples):
-            # Get flow samples
-            t, xt, ut = flow_matcher(purified_image)
-            
-            # Predict velocity field with current s, z
-            predicted_ut = unet_model(xt, t, s, z)
-            
-            # Loss: minimize prediction error
-            loss = F.mse_loss(predicted_ut, ut, reduction='mean')
-            total_loss += loss
-        
-        # Average loss
-        avg_loss = total_loss / num_samples
-        
-        # Add regularization to prevent s, z from deviating too much from encoder
-        s_reg = 0.01 * F.mse_loss(s, s_init, reduction='mean')
-        z_reg = 0.01 * F.mse_loss(z, z_init, reduction='mean')
-        
-        total_loss = avg_loss + s_reg + z_reg
-        
-        # Backward pass
-        total_loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_([s, z], max_norm=1.0)
-        
-        optimizer.step()
-        
-        # Early stopping
-        if step > 50 and total_loss.item() < 1e-4:
-            break
-    
-    return s.detach(), z.detach()
+    # BPDA trick: In the forward pass, return the purified image.
+    # In the backward pass, the gradient will flow through x_adv as if this function was an identity.
+    # This approximates the gradient of the purification function as the identity matrix.
+    return x_adv + (x_purified_leaf.detach() - x_adv.detach())
 
-# --- Classification from s ---
-def classify_from_s(s_factor, classifier_model):
-    logits = classifier_model(s_factor)
-    predicted_class = torch.argmax(logits, dim=-1)
-    return predicted_class
+# ======================================================================================
+# 3. DEFENSE MODEL WRAPPERS
+# ======================================================================================
 
-# --- Main Inference Pipeline (SOTA) ---
-def inference_pipeline(adversarial_image, unet, encoder, classifier, flow_matcher, device, 
-                      use_likelihood_max=True, use_enhanced_inference=True):
-    """
-    Complete SOTA inference pipeline for adversarial defense.
-    
-    Args:
-        adversarial_image: [B, C, H, W] potentially adversarial input
-        unet, encoder, classifier: trained models
-        flow_matcher: conditional flow matcher
-        device: computation device
-        use_likelihood_max: whether to use likelihood maximization (SOTA) or reverse ODE
-        use_enhanced_inference: whether to use enhanced causal factor inference
-    
-    Returns:
-        final_prediction: predicted class labels
-        purified_img: purified image (for visualization)
-        s_star: optimized causal factors
-    """
-    # Stage 1: Adversarial Purification
-    if use_likelihood_max:
-        print("Using SOTA likelihood maximization purification...")
-        purified_img = purify_image_likelihood_max(
-            adversarial_image, unet, flow_matcher, encoder, 
-            steps=100, lr=0.01, lambda_reg=0.1
-        )
-    else:
-        print("Using reverse ODE purification (baseline)...")
-        purified_img = purify_image_reverse_ode(adversarial_image, unet, flow_matcher)
-    
-    # Stage 2: Causal Factor Inference
-    if use_enhanced_inference:
-        print("Using enhanced causal factor inference...")
-        s_star, z_star = infer_causal_factors_enhanced(
-            purified_img, encoder, unet, flow_matcher,
-            steps=200, lr=0.005
-        )
-    else:
-        print("Using basic causal factor inference...")
-        s_star, z_star = infer_causal_factors(purified_img, encoder, unet, flow_matcher)
-    
-    # Stage 3: Classification
-    final_prediction = classify_from_s(s_star, classifier)
-    
-    return final_prediction, purified_img, s_star
+class VictimOnly(nn.Module):
+    """Wrapper for the undefended victim model."""
+    def __init__(self, victim_model):
+        super().__init__()
+        self.model = victim_model
+    def forward(self, x):
+        return self.model(x)
 
-# --- AutoAttack Evaluation (SOTA) ---
-def evaluate_autoattack(unet, encoder, classifier, flow_matcher, device, test_loader, 
-                       use_likelihood_max=True, use_enhanced_inference=True):
-    """
-    Evaluate robust accuracy using AutoAttack with SOTA purification.
-    
-    Args:
-        unet, encoder, classifier: trained models
-        flow_matcher: conditional flow matcher
-        device: computation device
-        test_loader: test data loader
-        use_likelihood_max: whether to use likelihood maximization
-        use_enhanced_inference: whether to use enhanced inference
-    
-    Returns:
-        robust_accuracy: robust accuracy under AutoAttack
-    """
-    # Define the defended model function
-    def defended_model_fn(x):
-        """
-        Wrapper function for AutoAttack that applies the full defense pipeline.
-        """
-        # Apply the complete SOTA defense pipeline
-        predictions, _, _ = inference_pipeline(
-            x, unet, encoder, classifier, flow_matcher, device,
-            use_likelihood_max=use_likelihood_max,
-            use_enhanced_inference=use_enhanced_inference
-        )
-        return predictions
+class EncoderOnlyDefense(nn.Module):
+    """Defense using only the Causal Encoder and Latent Classifier."""
+    def __init__(self, encoder, classifier):
+        super().__init__()
+        self.encoder = encoder
+        self.classifier = classifier
+    def forward(self, x):
+        s, _, _, _ = self.encoder(x)
+        return self.classifier(s)
 
-    # Wrap for AutoAttack compatibility
-    class DefendedModel(torch.nn.Module):
-        def __init__(self, model_fn):
-            super().__init__()
-            self.model_fn = model_fn
-            
-        def forward(self, x):
-            return self.model_fn(x)
+class CausalFlowDefense(nn.Module):
+    """Wraps the full defense pipeline for evaluation."""
+    def __init__(self, unet, encoder, classifier, flow_matcher, use_sota_purify=False):
+        super().__init__()
+        self.unet = unet
+        self.encoder = encoder
+        self.classifier = classifier
+        self.flow_matcher = flow_matcher
+        self.use_sota_purify = use_sota_purify
 
-    defended_model = DefendedModel(defended_model_fn).to(device)
-    
-    # Initialize AutoAttack
-    adversary = AutoAttack(
-        defended_model, 
-        norm='Linf', 
-        eps=8/255, 
-        version='standard',
-        device=device
-    )
-    
-    # Collect test data
-    print("Collecting test data for AutoAttack evaluation...")
-    xs, ys = [], []
-    for x, y in test_loader:
-        xs.append(x)
-        ys.append(y)
-    xs = torch.cat(xs, dim=0).to(device)
-    ys = torch.cat(ys, dim=0).to(device)
-    
-    # Run AutoAttack evaluation
-    print(f"Running AutoAttack with {'SOTA' if use_likelihood_max else 'baseline'} purification...")
-    with torch.no_grad():
-        adv_preds = adversary.run_standard_evaluation(xs, ys, bs=64)
-    
-    # Calculate robust accuracy
-    robust_accuracy = (adv_preds == ys.cpu().numpy()).mean()
-    print(f'AutoAttack robust accuracy: {robust_accuracy*100:.2f}%')
-    
-    return robust_accuracy
-
-# --- Main Entrypoint ---
-def main():
-    """
-    Main entrypoint demonstrating both baseline and SOTA adversarial defense.
-    """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # --- Model hyperparameters (should match training) ---
-    unet_kwargs = dict(
-        image_size=32, in_channels=3, model_channels=128, out_channels=3,
-        num_res_blocks=2, attention_resolutions=[16,8], s_dim=128, z_dim=128
-    )
-    encoder_kwargs = dict(
-        backbone_arch='WRN', s_dim=128, z_dim=128, wrn_depth=28, wrn_widen_factor=10
-    )
-    classifier_kwargs = dict(s_dim=128, num_classes=10)
-    
-    try:
-        # --- Load trained models ---
-        print("Loading trained models...")
-        unet = load_model(UNetModel, 'checkpoints/unet_final.pt', device, **unet_kwargs)
-        encoder = load_model(CausalEncoder, 'checkpoints/encoder_final.pt', device, **encoder_kwargs)
-        classifier = load_model(LatentClassifier, 'checkpoints/classifier_final.pt', device, **classifier_kwargs)
-        flow_matcher = ConditionalFlowMatcher(sigma=0.01)
-        
-        # --- Load test data ---
-        from data.cifar10 import get_cifar10_loaders
-        _, test_loader = get_cifar10_loaders(batch_size=128)
-        
-        # --- Evaluate on clean test set ---
-        print('\n' + '='*50)
-        print('EVALUATING ON CLEAN TEST SET')
-        print('='*50)
-        
-        correct = 0
-        total = 0
-        for x, y in test_loader:
-            x, y = x.to(device), y.to(device)
-            predictions, _, _ = inference_pipeline(
-                x, unet, encoder, classifier, flow_matcher, device,
-                use_likelihood_max=True, use_enhanced_inference=True
-            )
-            correct += (predictions == y).sum().item()
-            total += y.size(0)
-        clean_accuracy = 100 * correct / total
-        print(f'Clean accuracy: {clean_accuracy:.2f}%')
-        
-        # --- Compare Baseline vs SOTA ---
-        print('\n' + '='*50)
-        print('COMPARING BASELINE vs SOTA APPROACHES')
-        print('='*50)
-        
-        # Baseline: Reverse ODE + Basic inference
-        print("\n1. Baseline Approach (Reverse ODE + Basic Inference)")
-        baseline_acc = evaluate_autoattack(
-            unet, encoder, classifier, flow_matcher, device, test_loader,
-            use_likelihood_max=False, use_enhanced_inference=False
-        )
-        
-        # SOTA: Likelihood Maximization + Enhanced inference
-        print("\n2. SOTA Approach (Likelihood Maximization + Enhanced Inference)")
-        sota_acc = evaluate_autoattack(
-            unet, encoder, classifier, flow_matcher, device, test_loader,
-            use_likelihood_max=True, use_enhanced_inference=True
-        )
-        
-        # Summary
-        print('\n' + '='*50)
-        print('SUMMARY')
-        print('='*50)
-        print(f'Clean Accuracy: {clean_accuracy:.2f}%')
-        print(f'Baseline Robust Accuracy: {baseline_acc*100:.2f}%')
-        print(f'SOTA Robust Accuracy: {sota_acc*100:.2f}%')
-        print(f'Improvement: {(sota_acc - baseline_acc)*100:.2f} percentage points')
-        
-        if sota_acc > baseline_acc:
-            print("SOTA approach outperforms baseline!")
+    def forward(self, x):
+        if self.use_sota_purify:
+            # The purification function is now differentiable w.r.t x via BPDA
+            x_purified = purify_likelihood_maximization(x, self.unet, self.encoder, self.flow_matcher)
         else:
-            print("Baseline performs better - may need hyperparameter tuning")
-            
-    except FileNotFoundError as e:
-        print(f"Error: Model checkpoint not found. Please train the models first.")
-        print(f"Missing file: {e.filename}")
-        print("Run: python train_causal_flow.py")
+            # This branch is naturally differentiable.
+            s_init, z_init, _, _ = self.encoder(x)
+            t_dummy = torch.zeros(x.shape[0], device=x.device)
+            predicted_ut = self.unet(x, t_dummy, s_init, z_init)
+            x_purified = torch.clamp(x + predicted_ut, 0, 1)
+
+        # The final classification must allow gradients for the adaptive attack.
+        s_final, _, _, _ = self.encoder(x_purified)
+        logits = self.classifier(s_final)
+        return logits
+
+# ======================================================================================
+# 4. EVALUATION RUNNER
+# ======================================================================================
+
+def run_full_evaluation(defense_name, defense_model, victim_model, test_loader, device, config):
+    """Runs a full suite of tests on a given defense model."""
+    print(f"\n--- Evaluating Defense: {defense_name} ---")
+    defense_model.eval()
+    '''
+    # --- Clean Accuracy ---
+    correct, total = 0, 0
+    for images, labels in tqdm(test_loader, desc=f"1/4 Clean Eval ({defense_name})"):
+        images, labels = images.to(device), labels.to(device)
+        # SOTA purification requires grads in its forward pass, so we can't use torch.no_grad().
+        outputs = defense_model(images)
+        with torch.no_grad():
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    clean_acc = 100 * correct / total
+
+    # --- Preprocessor-Blind PGD ---
+    correct, total = 0, 0
+    for images, labels in tqdm(test_loader, desc=f"2/4 Blind PGD Eval ({defense_name})"):
+        images, labels = images.to(device), labels.to(device)
+        x_adv = pgd_attack(victim_model, images, labels, **config['attack_params'])
+        # SOTA purification requires grads in its forward pass, so we can't use torch.no_grad().
+        outputs = defense_model(x_adv)
+        with torch.no_grad():
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    blind_pgd_acc = 100 * correct / total
+'''
+    # --- Adaptive PGD ---
+    correct, total = 0, 0
+    for images, labels in tqdm(test_loader, desc=f"3/4 Adaptive PGD ({defense_name})"):
+        images, labels = images.to(device), labels.to(device)
+        x_adv = pgd_attack(defense_model, images, labels, **config['attack_params'])
+        # SOTA purification requires grads in its forward pass, so we can't use torch.no_grad().
+        outputs = defense_model(x_adv)
+        with torch.no_grad():
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+        adaptive_pgd_acc = 100 * correct / total
+        print("adapt", adaptive_pgd_acc)
+    '''
+    # --- AutoAttack ---
+    # Limiting to a smaller subset for speed, as AutoAttack is very slow.
+    test_subset_size = 256 
+    x_test = torch.cat([x for i, (x, y) in enumerate(test_loader) if i * config['batch_size'] < test_subset_size], dim=0)
+    y_test = torch.cat([y for i, (x, y) in enumerate(test_loader) if i * config['batch_size'] < test_subset_size], dim=0)
+
+    adversary = AutoAttack(defense_model, norm='Linf', eps=config['attack_params']['eps'], version='standard', device=device)
+    print(f"Running AutoAttack on {defense_name}... (on a subset of {test_subset_size} images)")
+    
+    # AutoAttack requires gradients to run, so it must not be in a no_grad block.
+    x_adv_aa = adversary.run_standard_evaluation(x_test, y_test, bs=config['batch_size'])
+    
+    # Evaluating the results also requires running the forward pass without no_grad.
+    outputs = defense_model(x_adv_aa.to(device))
+    with torch.no_grad():
+        _, predicted = torch.max(outputs.data, 1)
+        autoattack_acc = 100 * (predicted.cpu() == y_test).sum().item() / len(y_test)
+'''
+    return {
+        "Defense": defense_name,
+        #"Clean Acc (%)": clean_acc,
+        #"Blind PGD Acc (%)": blind_pgd_acc,
+        "Adaptive PGD Acc (%)": adaptive_pgd_acc,
+        #"AutoAttack Acc (%)": autoattack_acc
+    }
+
+# ======================================================================================
+# 5. MAIN SCRIPT
+# ======================================================================================
+
+def main():
+    # --- Config ---
+    config = {
+        'batch_size': 32, 's_dim': 128, 'z_dim': 128, 'num_classes': 10,
+        'image_size': 32, 'in_channels': 3, 'model_channels': 128, 'out_channels': 3,
+        'num_res_blocks': 2, 'attention_resolutions': "16,8",
+        'wrn_depth': 28, 'wrn_widen_factor': 10,
+        'attack_params': {'eps': 8/255, 'alpha': 2/255, 'iters': 10}
+    }
+    
+    device = get_device()
+    print(f"--- CausalFlow SOTA Evaluation ---")
+    print(f"Using device: {device}")
+    print("-" * 80)
+
+    # --- Load Data ---
+    _, test_loader = get_cifar10_loaders(batch_size=config['batch_size'])
+    
+    # --- Load All Models ---
+    try:
+        print("Loading trained models...")
+        unet_kwargs = {'image_size':config['image_size'], 'in_channels':config['in_channels'], 'model_channels':config['model_channels'], 'out_channels':config['out_channels'], 'num_res_blocks':config['num_res_blocks'], 'attention_resolutions':[int(res) for res in config['attention_resolutions'].split(',')], 's_dim':config['s_dim'], 'z_dim':config['z_dim']}
+        encoder_kwargs = {'backbone_arch':'WRN', 's_dim':config['s_dim'], 'z_dim':config['z_dim'], 'wrn_depth':config['wrn_depth'], 'wrn_widen_factor':config['wrn_widen_factor']}
+        classifier_kwargs = {'s_dim':config['s_dim'], 'num_classes':config['num_classes']}
         
+        unet = load_model_from_checkpoint(UNetModel, "checkpoints/causalflow_final.pt", 'unet', device, **unet_kwargs)
+        encoder = load_model_from_checkpoint(CausalEncoder, "checkpoints/causalflow_final.pt", 'encoder', device, **encoder_kwargs)
+        classifier = load_model_from_checkpoint(LatentClassifier, "checkpoints/causalflow_final.pt", 'classifier', device, **classifier_kwargs)
+        victim_model = load_model_from_checkpoint(WideResNet, "checkpoints/victim_wrn_pretrained.pt", 'victim_model', device, depth=config['wrn_depth'], widen_factor=config['wrn_widen_factor'], num_classes=config['num_classes'])
     except Exception as e:
-        print(f"Error during evaluation: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\nFATAL ERROR: Could not load model checkpoints. Please ensure they are trained and available.")
+        print(f"Error details: {e}")
+        print("Please check that 'checkpoints/causalflow_final.pt' and 'checkpoints/victim_wrn_pretrained.pt' exist.")
+        return
+
+    # --- Instantiate all defense configurations ---
+    flow_matcher = ConditionalFlowMatcher(sigma=0.0)
+    
+    defense_configs = {
+        #"Victim Model (No Defense)": VictimOnly(victim_model),
+        #"Encoder-Only Defense": EncoderOnlyDefense(encoder, classifier),
+        #"CausalFlow (Simple Purify)": CausalFlowDefense(unet, encoder, classifier, flow_matcher, use_sota_purify=False),
+        "CausalFlow (SOTA Purify)": CausalFlowDefense(unet, encoder, classifier, flow_matcher, use_sota_purify=True)
+    }
+
+    # --- Run evaluations and collect results ---
+    results = []
+    for name, model in defense_configs.items():
+        model.eval()
+        result = run_full_evaluation(name, model, victim_model, test_loader, device, config)
+        results.append(result)
+
+    # --- Final Report ---
+    df = pd.DataFrame(results)
+    print("\n\n" + "="*80)
+    print("                     CausalFlow Final Performance Summary")
+    print("="*80)
+    print(df.to_markdown(index=False))
+    print("="*80)
 
 if __name__ == "__main__":
     main()

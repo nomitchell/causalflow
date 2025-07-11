@@ -1,15 +1,7 @@
 # modules/cfm.py (Conditional Flow Matcher)
 # PURPOSE: Implements the Rectified Flow logic from the FlowPure paper. This module
 # is responsible for creating the `(t, x_t, u_t)` tuples needed for training the
-# U-Net at each step. It is the engine of the "flow" part of CausalFlow.
-#
-# WHERE TO GET CODE: The logic is directly from the FlowPure paper's methodology
-# and can be adapted from its official implementation.
-
-'''
-some improvements could be with source distribution, noise to data
-increase sigma
-'''
+# U-Net at each step.
 
 import torch
 import torch.nn as nn
@@ -19,24 +11,29 @@ class ConditionalFlowMatcher(nn.Module):
         super().__init__()
         self.sigma = sigma
 
-    def sample_source(self, x: torch.Tensor) -> torch.Tensor:
-        # Sample another image from the batch as the source (could also use noise)
-        return x[torch.randperm(x.shape[0], device=x.device)]
+    def forward(self, x0: torch.Tensor, x1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Calculates the training tuple for a flow from a starting point x0 (adversarial)
+        to a target point x1 (clean).
+        """
+        x0 = x0.float()
+        x1 = x1.float()
 
-    def forward(self, x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_clean = x_clean.float()
-        x_source = self.sample_source(x_clean)
-        
-        # Create a 1D tensor for t
-        t = torch.rand(x_clean.shape[0], device=x_clean.device)
+        # Create a 1D tensor for time t
+        t = torch.rand(x0.shape[0], device=x0.device)
         
         # Create a broadcastable version of t for interpolation
         t_broadcast = t.view(-1, 1, 1, 1)
         
-        x_t = (1 - t_broadcast) * x_source + t_broadcast * x_clean
+        # Interpolate between the start (x0) and end (x1) points
+        x_t = (1 - t_broadcast) * x0 + t_broadcast * x1
+        
+        # Add optional noise, as described in the FlowPure paper
         if self.sigma > 0:
             x_t += torch.randn_like(x_t) * self.sigma
-        u_t = x_clean - x_source
+            
+        # The velocity field u_t is the direct path from start to end
+        u_t = x1 - x0
         
-        # Return the 1D t tensor
+        # Return the 1D time tensor, the interpolated point, and the velocity
         return t, x_t, u_t
