@@ -1,8 +1,8 @@
-# training/train_purifier_gaussian.py
-# This is the new training script for Stage 2 of the CausalFlow pipeline.
-# It trains the CausalUNet to be a general-purpose, attack-agnostic denoiser.
-# The training objective is a combination of a flow-matching loss (in pixel space)
-# and a latent-guidance loss (in the causal `s` space).
+# training/train_purifier_gaussian_z_agnostic.py
+# This is the EXPERIMENTAL script for the "Causal Purity" question.
+# It trains the CausalUNet as a general-purpose denoiser, guided by
+# the target `s` vector but a RANDOM `z` vector. This tests if making
+# the purifier insensitive to style improves robustness.
 
 import os
 import argparse
@@ -32,7 +32,8 @@ def get_config_and_setup(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config_obj.device = device
     
-    print(f"--- Purifier Training Stage 2 (Gaussian Denoising) ---")
+    print(f"--- Purifier Training (z-Agnostic Experiment) ---")
+    print(f"Guiding with target `s` and RANDOM `z`.")
     print(f"Using device: {device}")
     
     return config_obj
@@ -53,7 +54,7 @@ def load_frozen_encoder(config, checkpoint_path):
     return encoder
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 2: Train Latent-Guided Gaussian Denoiser")
+    parser = argparse.ArgumentParser(description="Stage 2 Experiment: Train z-Agnostic denoiser")
     parser.add_argument('--config', type=str, default='configs/cifar10.yml', help='Path to the config file.')
     parser.add_argument('--encoder_checkpoint', type=str, default='./checkpoints/causal_encoder_best.pt')
     parser.add_argument('--checkpoint_path', type=str, default='./checkpoints')
@@ -61,84 +62,61 @@ def main():
     
     config = get_config_and_setup(args)
     
-    # --- Data Loading ---
     train_dataset = CIFAR10(root='./data', train=True, download=True, transform=CIFAR10.transform)
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
 
-    # --- Model Initialization ---
     purifier_unet = CausalUNet(config).to(config.device)
     frozen_encoder = load_frozen_encoder(config, args.encoder_checkpoint)
 
-    # --- Optimizer ---
     optimizer = torch.optim.Adam(purifier_unet.parameters(), lr=config.lr)
-
-    # --- Loss Functions ---
     pixel_loss_fn = nn.MSELoss()
     latent_loss_fn = nn.MSELoss()
-    
-    # --- Flow Matcher ---
     cfm = ConditionalFlowMatcher(sigma=config.sigma)
 
     os.makedirs(args.checkpoint_path, exist_ok=True)
 
-    # --- Training Loop ---
-    print("--- Starting Stage 2: Latent-Guided Denoiser Training ---")
+    print("--- Starting Stage 2 (z-Agnostic) Training ---")
     for epoch in range(config.joint_finetune_epochs):
         purifier_unet.train()
-        pbar = tqdm(train_loader, desc=f"[Denoiser Train Epoch {epoch+1}]")
+        pbar = tqdm(train_loader, desc=f"[z-Agnostic Train Epoch {epoch+1}]")
         
         for i, (x_clean, y_true) in enumerate(pbar):
             x_clean = x_clean.to(config.device)
             
-            # --- KEY CHANGE: Use Gaussian Noise, not Adversarial Attacks ---
-            # Corrupt the clean image with Gaussian noise.
-            noise = torch.randn_like(x_clean) * config.noise_std # `noise_std` is a new hyperparameter
+            noise = torch.randn_like(x_clean) * config.noise_std
             x_noisy = x_clean + noise
-            # -------------------------------------------------------------
 
             optimizer.zero_grad()
 
-            # 1. Get the ground-truth `s` and `z` vectors from the clean image.
             with torch.no_grad():
-                s_target, z_target, _, _ = frozen_encoder(x_clean)
+                s_target, _, _, _ = frozen_encoder(x_clean)
 
-            # 2. Sample the flow path from the NOISY image to the CLEAN image.
             t, xt, ut = cfm.sample_location_and_conditional_flow(x_0=x_noisy, x_1=x_clean)
             
-            # 3. Predict the velocity field using the UNet, guided by the target latents.
-            predicted_ut = purifier_unet(xt, t, s_target, z_target)
+            # --- EXPERIMENTAL LOGIC: Guide with target `s` and RANDOM `z` ---
+            z_random = torch.randn_like(s_target) # Sample z from the prior N(0,1)
+            predicted_ut = purifier_unet(xt, t, s_target, z_random)
+            # -------------------------------------------------------------
             
-            # 4. Calculate the primary flow-matching loss in pixel space.
-            # This teaches the UNet to map noisy inputs to clean ones.
             flow_loss = pixel_loss_fn(predicted_ut, ut)
 
-            # 5. Calculate the secondary, causal guidance loss in latent space.
-            # This ensures the purified output has the correct semantic meaning.
             with torch.no_grad():
                 x_denoised_single_step = torch.clamp(xt - predicted_ut * (1. - t[:, None, None, None]), 0, 1)
                 s_denoised, _, _, _ = frozen_encoder(x_denoised_single_step)
             
             latent_loss = latent_loss_fn(s_denoised, s_target)
 
-            # 6. Combine the losses. `lambda_latent` is a new hyperparameter.
             total_loss = flow_loss + config.lambda_latent * latent_loss
             
             total_loss.backward()
             optimizer.step()
             
-            pbar.set_postfix({
-                "Total Loss": f"{total_loss.item():.4f}",
-                "Flow Loss": f"{flow_loss.item():.4f}",
-                "Latent Loss": f"{latent_loss.item():.4f}"
-            })
-        
-        # A validation loop would go here to save the best model based on robust accuracy.
-        # This is omitted for brevity but is essential for the final project.
+            pbar.set_postfix({"Total Loss": f"{total_loss.item():.4f}"})
 
-    print("--- Stage 2 Training Complete ---")
+    print("--- Stage 2 (z-Agnostic) Training Complete ---")
     torch.save({
         'purifier_state_dict': purifier_unet.state_dict(),
-    }, os.path.join(args.checkpoint_path, 'gaussian_purifier_final.pt'))
+    }, os.path.join(args.checkpoint_path, 'purifier_z_agnostic_final.pt'))
 
 if __name__ == '__main__':
     main()
