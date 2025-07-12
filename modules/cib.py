@@ -1,7 +1,7 @@
 # modules/cib.py
 # This file has been rewritten to fix a critical numerical instability bug.
 # The CLUB module now correctly calculates the mutual information upper bound,
-# which is used as the disentanglement loss.
+# and its internal MLP is stabilized with a Tanh activation on the mu output.
 
 import torch
 import torch.nn as nn
@@ -17,13 +17,18 @@ class CLUB(nn.Module):
         self.p_mu = nn.Sequential(
             nn.Linear(s_dim, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, z_dim)
+            nn.Linear(hidden_size, z_dim),
+            # --- KEY STABILITY FIX ---
+            # Bounding the output of the mean prediction prevents the squared error
+            # term in the log-likelihood from exploding.
+            nn.Tanh() 
+            # --- END FIX ---
         )
         self.p_logvar = nn.Sequential(
             nn.Linear(s_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, z_dim),
-            nn.Tanh() # Tanh to bound the log-variance for stability
+            nn.Tanh() # Tanh also bounds the log-variance for stability
         )
 
     def get_mu_logvar(self, s_prime):

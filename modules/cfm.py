@@ -1,39 +1,62 @@
-# modules/cfm.py (Conditional Flow Matcher)
-# PURPOSE: Implements the Rectified Flow logic from the FlowPure paper. This module
-# is responsible for creating the `(t, x_t, u_t)` tuples needed for training the
-# U-Net at each step.
+# modules/cfm.py
+# This is the corrected and verified version of the Conditional Flow Matcher module.
+# It ensures the `sample_location_and_conditional_flow` method is correctly defined
+# to be used by the Stage 2 purifier training scripts.
 
 import torch
 import torch.nn as nn
 
 class ConditionalFlowMatcher(nn.Module):
+    """
+    Implements the Conditional Flow Matching (CFM) logic as described in the
+    FlowPure paper, using the rectified flow formulation.
+    """
     def __init__(self, sigma: float = 0.0):
+        """
+        Initializes the flow matcher.
+
+        Args:
+            sigma (float): The standard deviation of the noise added to the path.
+                           A small value is used for rectified flows.
+        """
         super().__init__()
         self.sigma = sigma
 
-    def forward(self, x0: torch.Tensor, x1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def sample_location_and_conditional_flow(self, x0: torch.Tensor, x1: torch.Tensor):
         """
-        Calculates the training tuple for a flow from a starting point x0 (adversarial)
-        to a target point x1 (clean).
-        """
-        x0 = x0.float()
-        x1 = x1.float()
+        Samples a time `t`, a point `xt` on the path between x0 and x1,
+        and the ground-truth velocity `ut` at that point.
 
-        # Create a 1D tensor for time t
+        This is the core function for training a CNF with Flow Matching.
+
+        Args:
+            x0 (torch.Tensor): The starting point of the flow (e.g., a noisy image).
+            x1 (torch.Tensor): The ending point of the flow (e.g., a clean image).
+
+        Returns:
+            t (torch.Tensor): A batch of sampled time steps, shape (B,).
+            xt (torch.Tensor): A batch of interpolated points on the path, shape (B, C, H, W).
+            ut (torch.Tensor): The ground-truth velocity at xt, shape (B, C, H, W).
+        """
+        # Sample a random time t for each sample in the batch
         t = torch.rand(x0.shape[0], device=x0.device)
         
-        # Create a broadcastable version of t for interpolation
-        t_broadcast = t.view(-1, 1, 1, 1)
+        # Linearly interpolate between x0 and x1 to get the point xt at time t
+        # xt = (1-t)*x0 + t*x1
+        xt = t.view(-1, 1, 1, 1) * x1 + (1 - t).view(-1, 1, 1, 1) * x0
         
-        # Interpolate between the start (x0) and end (x1) points
-        x_t = (1 - t_broadcast) * x0 + t_broadcast * x1
+        # The velocity of the rectified flow is constant along the path
+        ut = x1 - x0
         
-        # Add optional noise, as described in the FlowPure paper
+        # Add a small amount of noise for stability if sigma > 0
         if self.sigma > 0:
-            x_t += torch.randn_like(x_t) * self.sigma
+            xt = xt + self.sigma * torch.randn_like(xt)
             
-        # The velocity field u_t is the direct path from start to end
-        u_t = x1 - x0
-        
-        # Return the 1D time tensor, the interpolated point, and the velocity
-        return t, x_t, u_t
+        return t, xt, ut
+
+    def forward(self, x0: torch.Tensor, x1: torch.Tensor):
+        """
+        The default forward pass simply calls the sampling method.
+        """
+        return self.sample_location_and_conditional_flow(x0, x1)
+

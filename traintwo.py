@@ -103,7 +103,7 @@ def main():
                 s_target, z_target, _, _ = frozen_encoder(x_clean)
 
             # 2. Sample the flow path from the NOISY image to the CLEAN image.
-            t, xt, ut = cfm.sample_location_and_conditional_flow(x_0=x_noisy, x_1=x_clean)
+            t, xt, ut = cfm.sample_location_and_conditional_flow(x0=x_noisy, x1=x_clean)
             
             # 3. Predict the velocity field using the UNet, guided by the target latents.
             predicted_ut = purifier_unet(xt, t, s_target, z_target)

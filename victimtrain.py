@@ -58,7 +58,7 @@ def main():
         depth=config.wrn_depth, 
         widen_factor=config.wrn_widen_factor, 
         num_classes=config.num_classes,
-        dropout_rate=0.3
+        dropRate=0.3
     ).to(config.device)
 
     # --- Optimizer and Scheduler ---
