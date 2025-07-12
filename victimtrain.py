@@ -43,16 +43,9 @@ def main():
     config = get_config_and_setup(args)
     
     # --- Data Loading and Augmentation ---
-    # For training, we use standard augmentations to improve generalization.
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-    # For testing, we only use ToTensor.
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    # We now explicitly get the correct transforms from our data module.
+    train_transform = CIFAR10.get_train_transform()
+    test_transform = CIFAR10.get_test_transform()
 
     train_dataset = CIFAR10(root='./data', train=True, download=True, transform=train_transform)
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
@@ -65,24 +58,29 @@ def main():
         depth=config.wrn_depth, 
         widen_factor=config.wrn_widen_factor, 
         num_classes=config.num_classes,
-        dropout_rate=0.3 # A standard dropout rate for WRN on CIFAR
+        dropout_rate=0.3
     ).to(config.device)
 
     # --- Optimizer and Scheduler ---
     criterion = nn.CrossEntropyLoss()
+    
+    # --- KEY CORRECTION: Use appropriate hyperparameters for SGD ---
+    # The previous learning rate of 1e-4 was far too low for SGD.
+    # We now use a standard, higher initial learning rate and a multi-step scheduler.
     optimizer = torch.optim.SGD(
         model.parameters(), 
-        lr=config.lr, 
+        lr=0.1, # Standard initial LR for SGD on CIFAR-10
         momentum=0.9, 
         weight_decay=5e-4
     )
-    # Cosine annealing scheduler helps in achieving better final accuracy.
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.victim_train_epochs)
+    # A multi-step scheduler that decays the LR is standard for WRN training.
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.1)
+    # This will decay the LR by 10x at epoch 100 and again at 150.
+    # --- END KEY CORRECTION ---
     
     best_acc = 0.0
     os.makedirs(args.checkpoint_path, exist_ok=True)
 
-    # --- Training Loop ---
     print(f"--- Starting Victim Model Training for {config.victim_train_epochs} epochs ---")
     for epoch in range(config.victim_train_epochs):
         model.train()
@@ -91,17 +89,14 @@ def main():
         
         for i, (inputs, labels) in enumerate(pbar):
             inputs, labels = inputs.to(config.device), labels.to(config.device)
-
             optimizer.zero_grad()
-            
             outputs = model(inputs)
             loss = criterion(outputs, labels)
-            
             loss.backward()
             optimizer.step()
             
             running_loss += loss.item()
-            pbar.set_postfix({"Loss": f"{running_loss / (i + 1):.4f}"})
+            pbar.set_postfix({"Loss": f"{running_loss / (i + 1):.4f}", "LR": f"{scheduler.get_last_lr()[0]:.4f}"})
         
         # --- Validation Loop ---
         model.eval()
@@ -118,13 +113,11 @@ def main():
         epoch_acc = 100 * correct / total
         print(f"\n---===[ Validation Epoch {epoch+1} ]===--- Accuracy: {epoch_acc:.2f}%")
 
-        # Save the best performing model
         if epoch_acc > best_acc:
             best_acc = epoch_acc
             print(f"*** New best accuracy: {best_acc:.2f}%. Saving victim model. ***")
             torch.save(model.state_dict(), os.path.join(args.checkpoint_path, 'victim_wrn_best.pt'))
         
-        # Step the scheduler
         scheduler.step()
 
     print("\n--- Victim Model Training Complete ---")

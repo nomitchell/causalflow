@@ -53,7 +53,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4)
 
     # --- Model Initialization ---
-    encoder = CausalEncoder(s_dim=config.s_dim, z_dim=config.z_dim).to(config.device)
+    encoder = CausalEncoder(backbone_arch="WRN", s_dim=config.s_dim, z_dim=config.z_dim).to(config.device)
     latent_classifier = LatentClassifier(s_dim=config.s_dim, num_classes=config.num_classes).to(config.device)
     club_estimator = CLUB(config.s_dim, config.z_dim, config.s_dim).to(config.device)
 
