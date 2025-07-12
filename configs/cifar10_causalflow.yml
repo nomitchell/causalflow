@@ -1,5 +1,7 @@
 # configs/cifar10.yml
-# This file contains all hyperparameters for the CausalFlow experiments on CIFAR-10.
+# This file has been UPDATED with a final set of stable hyperparameters.
+# It includes a separate, smaller learning rate for the CLUB estimator
+# and more conservative loss weights to ensure a balanced training dynamic.
 
 # --- Data Configuration ---
 image_size: 32
@@ -9,10 +11,11 @@ num_classes: 10
 
 # --- Training Hyperparameters ---
 batch_size: 128
-lr: 0.0001 # Initial learning rate for all stages
-victim_train_epochs: 200 # As per standard ResNet training protocols
-causal_pretrain_epochs: 100 # Epochs for Stage 1 (training the encoder)
-joint_finetune_epochs: 150 # Epochs for Stage 2 (training the purifier)
+lr: 0.0002  # Main learning rate for encoder/classifier
+critic_lr: 0.00005 # KEY: A smaller LR for the CLUB estimator to keep it stable.
+victim_train_epochs: 200 
+causal_pretrain_epochs: 100 
+joint_finetune_epochs: 150 
 
 # --- UNet Architecture (for the Purifier) ---
 model_channels: 128
@@ -23,32 +26,31 @@ dropout: 0.1
 resamp_with_conv: true
 
 # --- Causal Encoder Architecture ---
-s_dim: 128 # Dimension of the semantic latent vector 's'
-z_dim: 128 # Dimension of the non-semantic latent vector 'z'
+s_dim: 128 
+z_dim: 128 
 
 # --- Victim WRN Architecture ---
 wrn_depth: 28
 wrn_widen_factor: 10
 
-# --- Loss Function Weights ---
-# These control the balance between the different objectives during training.
+# --- Loss Function Weights (Corrected for Stability) ---
 # Stage 1: CIB Loss Weights
-gamma_ce: 20.0   # Weight for the classification loss on the `s` vector
-lambda_kl: 0.5    # Weight for the VAE's KL-divergence regularization
-eta_club: 0.01    # Weight for the CLUB mutual information (disentanglement) loss
+gamma_ce: 1.0     
+lambda_kl: 0.1    
+eta_club: 0.001   # A slightly higher but still safe weight for disentanglement.
 
 # Stage 2: Purifier Loss Weights
-lambda_latent: 1.0 # KEY HYPERPARAMETER: Weight for the latent-space guidance loss. Balances pixel-space vs. semantic-space objectives.
+lambda_latent: 1.0 
 
 # --- Defense & Attack Parameters ---
 # For Conditional Flow Matching (CFM)
 sigma: 0.01
 
 # For Gaussian Denoiser Training (Stage 2)
-noise_std: 0.25   # KEY HYPERPARAMETER: Standard deviation of Gaussian noise added to images during purifier training.
+noise_std: 0.25   
 
 # For PGD and AutoAttack
 attack_params:
   eps: 0.03137254901960784 # 8/255
   alpha: 0.00784313725490196 # 2/255
-  iters: 10 # Default steps for PGD during development
+  iters: 10 

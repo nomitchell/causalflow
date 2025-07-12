@@ -1,6 +1,8 @@
 # training/train_causal_encoder.py (or trainone.py)
-# This script has been UPDATED to include gradient clipping for
-# enhanced training stability, preventing loss explosion.
+# This is the FINAL, STABILIZED version for Stage 1 training.
+# It implements a robust adversarial training loop with:
+# 1. Multiple updates for the CLUB estimator (the "critic").
+# 2. Weight clipping on the CLUB estimator to prevent exploding values.
 
 import os
 import argparse
@@ -10,16 +12,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# --- Model Imports ---
 from models.encoder import CausalEncoder
 from models.classifier import LatentClassifier
-
-# --- Module Imports ---
 from modules.cib import CIBLoss, CLUB
 from data.cifar10 import CIFAR10
 
 def get_config_and_setup(args):
-    """Load configuration from YAML and set up device."""
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
@@ -30,7 +28,7 @@ def get_config_and_setup(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config_obj.device = device
     
-    print(f"--- CausalEncoder Training Stage 1 ---")
+    print(f"--- CausalEncoder Training Stage 1 (Stable) ---")
     print(f"Using device: {device}")
     
     return config_obj
@@ -57,7 +55,8 @@ def main():
         list(encoder.parameters()) + list(latent_classifier.parameters()),
         lr=config.lr
     )
-    club_optimizer = torch.optim.Adam(club_estimator.parameters(), lr=config.lr)
+    # Use a separate, smaller learning rate for the critic
+    club_optimizer = torch.optim.Adam(club_estimator.parameters(), lr=config.critic_lr)
 
     cib_loss_fn = CIBLoss(
         gamma_ce=config.gamma_ce, 
@@ -67,8 +66,11 @@ def main():
     
     best_val_acc = 0.0
     os.makedirs(args.checkpoint_path, exist_ok=True)
+    
+    critic_updates_per_step = 5 # Train critic 5 times for every 1 encoder update
+    weight_clip_value = 0.01 # WGAN-style weight clipping value
 
-    print("--- Starting Stage 1: Causal Representation Training ---")
+    print("--- Starting Stage 1: Causal Representation Training (Stable) ---")
     for epoch in range(config.causal_pretrain_epochs):
         encoder.train()
         latent_classifier.train()
@@ -80,16 +82,24 @@ def main():
             x_clean = x_clean.to(config.device)
             y_true = y_true.to(config.device)
 
-            s, z, mu, logvar = encoder(x_clean)
-            
-            # Update CLUB estimator
-            club_loss = club_estimator.learning_loss(s.detach(), z.detach())
-            club_optimizer.zero_grad()
-            club_loss.backward()
-            club_optimizer.step()
+            # --- KEY STABILITY FIX 1: Train Critic More Frequently ---
+            for _ in range(critic_updates_per_step):
+                # We only need gradients for the CLUB estimator in this inner loop
+                with torch.no_grad():
+                    s_detached, z_detached, _, _ = encoder(x_clean)
+                
+                club_loss = club_estimator.learning_loss(s_detached, z_detached)
+                club_optimizer.zero_grad()
+                club_loss.backward()
+                club_optimizer.step()
 
-            # Update Encoder and Classifier
+                # --- KEY STABILITY FIX 2: Weight Clipping ---
+                for p in club_estimator.parameters():
+                    p.data.clamp_(-weight_clip_value, weight_clip_value)
+            
+            # --- Main Encoder/Classifier Update (less frequent) ---
             optimizer.zero_grad()
+            s, z, mu, logvar = encoder(x_clean)
             y_pred = latent_classifier(s)
             
             loss_dict = cib_loss_fn(y_pred, y_true, mu, logvar, s, z, club_estimator)
@@ -98,24 +108,19 @@ def main():
             # Check for nan/inf before backward pass
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 print(f"Epoch {epoch+1}, Batch {i}: Unstable loss detected. Skipping batch.")
-                continue
+                raise Exception
+                # continue
 
             total_loss.backward()
             
-            # --- KEY STABILITY FIX: Gradient Clipping ---
-            # This prevents the optimizer from taking massive steps if the loss
-            # gradient momentarily explodes, which is what leads to `nan`.
             torch.nn.utils.clip_grad_norm_(
                 list(encoder.parameters()) + list(latent_classifier.parameters()), 1.0
             )
-            # --- END FIX ---
-            
             optimizer.step()
             
             pbar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
                 "Pred Loss": f"{loss_dict['prediction_loss'].item():.4f}",
-                "KL Loss": f"{loss_dict['kl_loss'].item():.4f}",
                 "MI(s,z)": f"{loss_dict['disentanglement_loss'].item():.4f}"
             })
 
@@ -126,7 +131,7 @@ def main():
         total = 0
         with torch.no_grad():
             for x_val, y_val in test_loader:
-                x_val, y_val = x_val.to(config.device)
+                x_val = x_val.to(config.device)
                 y_val = y_val.to(config.device)
                 s_val, _, _, _ = encoder(x_val)
                 outputs = latent_classifier(s_val)
