@@ -1,8 +1,6 @@
-# training/train_causal_encoder.py
-# This is the training script for Stage 1 of the CausalFlow pipeline.
-# Its sole purpose is to train the CausalEncoder and LatentClassifier to learn
-# a robust, disentangled representation (s, z) from clean images.
-# The UNet is NOT used in this stage.
+# training/train_causal_encoder.py (or trainone.py)
+# This script has been UPDATED to include gradient clipping for
+# enhanced training stability, preventing loss explosion.
 
 import os
 import argparse
@@ -45,26 +43,22 @@ def main():
     
     config = get_config_and_setup(args)
     
-    # --- Data Loading ---
-    train_dataset = CIFAR10(root='./data', train=True, download=True, transform=CIFAR10.transform)
+    train_dataset = CIFAR10(root='./data', train=True, download=True, transform=CIFAR10.get_train_transform())
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
     
-    test_dataset = CIFAR10(root='./data', train=False, download=True, transform=CIFAR10.transform)
+    test_dataset = CIFAR10(root='./data', train=False, download=True, transform=CIFAR10.get_test_transform())
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4)
 
-    # --- Model Initialization ---
-    encoder = CausalEncoder(backbone_arch="WRN", s_dim=config.s_dim, z_dim=config.z_dim).to(config.device)
+    encoder = CausalEncoder(s_dim=config.s_dim, z_dim=config.z_dim).to(config.device)
     latent_classifier = LatentClassifier(s_dim=config.s_dim, num_classes=config.num_classes).to(config.device)
-    club_estimator = CLUB(config.s_dim, config.z_dim, config.s_dim).to(config.device)
+    club_estimator = CLUB(config.s_dim, config.z_dim, config.s_dim * 2).to(config.device)
 
-    # --- Optimizer ---
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(latent_classifier.parameters()),
         lr=config.lr
     )
     club_optimizer = torch.optim.Adam(club_estimator.parameters(), lr=config.lr)
 
-    # --- Loss Function ---
     cib_loss_fn = CIBLoss(
         gamma_ce=config.gamma_ce, 
         lambda_kl=config.lambda_kl, 
@@ -74,7 +68,6 @@ def main():
     best_val_acc = 0.0
     os.makedirs(args.checkpoint_path, exist_ok=True)
 
-    # --- Training Loop ---
     print("--- Starting Stage 1: Causal Representation Training ---")
     for epoch in range(config.causal_pretrain_epochs):
         encoder.train()
@@ -101,13 +94,29 @@ def main():
             
             loss_dict = cib_loss_fn(y_pred, y_true, mu, logvar, s, z, club_estimator)
             total_loss = loss_dict['total_loss']
+            
+            # Check for nan/inf before backward pass
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"Epoch {epoch+1}, Batch {i}: Unstable loss detected. Skipping batch.")
+                continue
+
             total_loss.backward()
+            
+            # --- KEY STABILITY FIX: Gradient Clipping ---
+            # This prevents the optimizer from taking massive steps if the loss
+            # gradient momentarily explodes, which is what leads to `nan`.
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(latent_classifier.parameters()), 1.0
+            )
+            # --- END FIX ---
+            
             optimizer.step()
             
             pbar.set_postfix({
                 "Total Loss": f"{total_loss.item():.4f}",
                 "Pred Loss": f"{loss_dict['prediction_loss'].item():.4f}",
-                "KL Loss": f"{loss_dict['kl_loss'].item():.4f}"
+                "KL Loss": f"{loss_dict['kl_loss'].item():.4f}",
+                "MI(s,z)": f"{loss_dict['disentanglement_loss'].item():.4f}"
             })
 
         # --- Validation Loop ---
@@ -128,9 +137,9 @@ def main():
         val_acc = 100 * correct / total
         print(f"---===[ Validation Epoch {epoch+1} ]===--- Clean Accuracy on S-vector: {val_acc:.2f}%")
 
-        if val_acc > best_acc:
-            best_acc = val_acc
-            print(f"*** New best validation accuracy: {best_acc:.2f}%. Saving model. ***")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            print(f"*** New best validation accuracy: {best_val_acc:.2f}%. Saving model. ***")
             torch.save({
                 'encoder_state_dict': encoder.state_dict(),
                 'latent_classifier_state_dict': latent_classifier.state_dict(),
