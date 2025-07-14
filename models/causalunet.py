@@ -1,271 +1,254 @@
-# Copyright 2022 The CausalFlow Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# SPDX-License-Identifier: Apache-2.0
-
-# --------------------------------------------------------------------------------
-# This file has been reviewed and refactored for clarity and correctness.
-#
-# Key Fixes Implemented:
-# 1. Corrected Tensor Reshaping: In `CausalResBlock`, the tensor reshaping for
-#    conditioning vectors `s_out` and `z_out` was changed from a potentially
-#    ambiguous `.view(s_out.shape, s_out.shape, 1, 1)` to the explicit and robust
-#    `.view(s_out.size(0), -1, 1, 1)`. This ensures the dimensions are handled
-#    correctly and makes the code's intent clear.
-#
-# 2. Verified Skip Connection Logic: The critical fix for the UNet's skip
-#    connections (`hs.append(h)`) was confirmed to be correctly implemented.
-#    Extensive comments have been added to explain its importance.
-# --------------------------------------------------------------------------------
-
-
-import torch.nn as nn
-import torch
-import torch.nn.functional as F
 import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from models.networks.fpunet.nn import (
-    conv3x3,
-    get_timestep_embedding,
-    Normalize,
-    default_init,
-)
+# --- Helper Modules ---
+
+def timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+    ).to(device=timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
 
 class CausalResBlock(nn.Module):
     """
-    A residual block for the CausalUNet that incorporates causal conditioning.
-    This block is the core component that allows the purification process to be
-    guided by the disentangled latent factors S (causal) and Z (non-causal).
-
-    The conditioning is applied using a mechanism similar to FiLM (Feature-wise
-    Linear Modulation), where:
-    - The causal factor 's' provides an *additive* bias (semantic content).
-    - The non-causal factor 'z' provides a *multiplicative* scaling (stylistic variation).
-    - The time embedding 't' provides an *additive* bias.
+    A residual block that includes causal conditioning via FiLM.
     """
-    def __init__(self, in_ch, out_ch, time_emb_dim, s_emb_dim, z_emb_dim,
-                 dropout, skip_rescale=True):
+    def __init__(self, channels, emb_channels, s_dim, z_dim, dropout, out_channels=None, use_conv=False, dims=2):
         super().__init__()
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-        self.skip_rescale = skip_rescale
+        self.channels = channels
+        self.out_channels = out_channels or channels
 
-        # Layers for processing the main feature map 'h'
-        self.norm1 = Normalize(in_ch)
-        self.conv1 = conv3x3(in_ch, out_ch)
-        self.norm2 = Normalize(out_ch)
-        self.conv2 = conv3x3(out_ch, out_ch, init_scale=0.)
-        self.dropout = nn.Dropout(dropout)
+        self.in_layers = nn.Sequential(
+            nn.GroupNorm(32, channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, self.out_channels, 3, padding=1),
+        )
 
-        # Linear layers to project the conditioning embeddings (t, s, z)
-        # to match the channel dimension of the feature map.
-        self.dense_t = nn.Linear(time_emb_dim, out_ch)
-        self.dense_s = nn.Linear(s_emb_dim, out_ch)
-        self.dense_z = nn.Linear(z_emb_dim, out_ch)
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_channels, self.out_channels),
+        )
+        self.s_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(s_dim, self.out_channels),
+        )
+        self.z_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(z_dim, self.out_channels),
+        )
 
-        # Initialize the projection layers
-        self.dense_t.weight.data = default_init()(self.dense_t.weight.data.shape)
-        nn.init.zeros_(self.dense_t.bias)
-        self.dense_s.weight.data = default_init()(self.dense_s.weight.data.shape)
-        nn.init.zeros_(self.dense_s.bias)
-        self.dense_z.weight.data = default_init()(self.dense_z.weight.data.shape)
-        nn.init.zeros_(self.dense_z.bias)
+        self.out_layers = nn.Sequential(
+            nn.GroupNorm(32, self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1),
+        )
 
-        # A final projection layer if input and output channels differ.
-        if in_ch != out_ch:
-            self.shortcut = conv3x3(in_ch, out_ch)
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = nn.Conv2d(channels, self.out_channels, 3, padding=1)
         else:
-            self.shortcut = nn.Identity()
+            self.skip_connection = nn.Conv2d(channels, self.out_channels, 1)
 
-        if skip_rescale:
-            self.rescale = 1 / math.sqrt(2.0)
-        else:
-            self.rescale = 1.0
+    def forward(self, x, emb, s, z):
+        h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        s_out = self.s_layers(s).type(h.dtype)
+        z_out = self.z_layers(z).type(h.dtype)
+        
+        emb_out = emb_out.view(emb_out.shape[0], emb_out.shape[1], 1, 1)
+        s_out = s_out.view(s_out.shape[0], s_out.shape[1], 1, 1)
+        z_out = z_out.view(z_out.shape[0], z_out.shape[1], 1, 1)
 
-    def forward(self, h, t_emb, s_emb, z_emb):
-        """
-        Forward pass for the CausalResBlock.
-
-        Args:
-            h (torch.Tensor): The input feature map.
-            t_emb (torch.Tensor): The time embedding.
-            s_emb (torch.Tensor): The causal latent factor embedding.
-            z_emb (torch.Tensor): The non-causal latent factor embedding.
-
-        Returns:
-            torch.Tensor: The output feature map.
-        """
-        # --- Pre-activation and first convolution ---
-        h_in = h
-        h = self.norm1(h)
-        h = F.swish(h)
-        h = self.conv1(h)
-
-        # --- Project and Reshape Conditioning Vectors ---
-        # Project embeddings to the output channel dimension
-        emb_out = self.dense_t(F.swish(t_emb))
-        s_out = self.dense_s(F.swish(s_emb))
-        z_out = self.dense_z(F.swish(z_emb))
-
-        # **FIX APPLIED HERE**
-        # Reshape the conditioning vectors to be broadcastable with the feature map `h`.
-        # The original code was ambiguous. This version is explicit and robust.
-        # It reshapes from (batch_size, channels) to (batch_size, channels, 1, 1).
-        emb_out = emb_out.view(emb_out.size(0), -1, 1, 1)
-        s_out = s_out.view(s_out.size(0), -1, 1, 1)
-        z_out = z_out.view(z_out.size(0), -1, 1, 1)
-
-        # --- Apply Conditioning and Second Convolution ---
-        h = self.norm2(h)
-        # Apply the FiLM-like causal conditioning
         h = h * (1 + z_out) + s_out + emb_out
-        h = F.swish(h)
-        h = self.dropout(h)
-        h = self.conv2(h)
+        h = self.out_layers(h)
+        return self.skip_connection(x) + h
 
-        # --- Apply Shortcut Connection ---
-        # Add the input to the output, applying a projection if channels differ.
-        shortcut_h = self.shortcut(h_in)
-        out = shortcut_h + h
+class AttentionBlock(nn.Module):
+    """Standard self-attention block."""
+    def __init__(self, channels, num_heads=1):
+        super().__init__()
+        self.num_heads = num_heads
+        assert channels % num_heads == 0
+        
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, 1)
+        self.attention = QKVAttention(num_heads)
+        self.proj_out = nn.Conv1d(channels, channels, 1)
 
-        return self.rescale * out
+    def forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
 
+class QKVAttention(nn.Module):
+    """Helper for AttentionBlock."""
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v)
+        return a.reshape(bs, -1, length)
+
+class Upsample(nn.Module):
+    def __init__(self, channels, use_conv, dims=2):
+        super().__init__()
+        self.use_conv = use_conv
+        if use_conv:
+            self.conv = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        if self.use_conv:
+            x = self.conv(x)
+        return x
+
+class Downsample(nn.Module):
+    def __init__(self, channels, use_conv, dims=2):
+        super().__init__()
+        if use_conv:
+            self.op = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
+        else:
+            self.op = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        return self.op(x)
 
 class CausalUNet(nn.Module):
     """
-    A UNet architecture adapted for causally-conditioned purification.
-    This model is based on the high-performance DDPM++ architecture, which is
-    also used by FlowPure, ensuring a fair and strong comparison. The key
-    innovation is the use of `CausalResBlock` to inject the guidance from
-    the latent factors `s` and `z` at each resolution level.
+    The full DDPM++ UNet model, adapted for causal conditioning.
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
-        ch = config.model.ch
-        num_res_blocks = config.model.num_res_blocks
-        ch_mult = tuple(config.model.ch_mult)
-        dropout = config.model.dropout
-        s_emb_dim = config.model.s_dim
-        z_emb_dim = config.model.z_dim
+        
+        image_size = config.image_size
+        in_channels = config.in_channels
+        model_channels = config.model_channels
+        out_channels = config.out_channels
+        num_res_blocks = config.num_res_blocks
+        attention_resolutions = config.attention_resolutions
+        dropout = config.dropout
+        channel_mult = config.channel_mult
+        conv_resample = config.resamp_with_conv
+        s_dim = config.s_dim
+        z_dim = config.z_dim
 
-        # --- Timestep Embedding ---
-        # This network projects the scalar time `t` into a high-dimensional vector.
-        time_emb_dim = ch * 4
-        self.time_embedding = nn.Sequential(
-            nn.Linear(ch, time_emb_dim),
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(model_channels, time_embed_dim),
             nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        # --- Downsampling Path (Encoder) ---
-        # The first convolution maps the input image (3 channels) to the base channel dimension.
-        self.conv_in = conv3x3(config.data.channels, ch)
-        
-        # Build the downsampling blocks of the UNet.
-        self.down_blocks = nn.ModuleList()
-        in_ch = ch
-        for i_level, mult in enumerate(ch_mult):
-            block = nn.ModuleList()
-            out_ch = ch * mult
-            for _ in range(num_res_blocks):
-                block.append(CausalResBlock(in_ch, out_ch, time_emb_dim, s_emb_dim, z_emb_dim, dropout))
-                in_ch = out_ch
-            # Add a downsampling layer at the end of each level (except the last).
-            if i_level != len(ch_mult) - 1:
-                block.append(nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1))
-            self.down_blocks.append(block)
-
-        # --- Middle Block ---
-        # The bottleneck of the UNet.
-        self.middle_block = nn.ModuleList([
-            CausalResBlock(in_ch, in_ch, time_emb_dim, s_emb_dim, z_emb_dim, dropout),
-            CausalResBlock(in_ch, in_ch, time_emb_dim, s_emb_dim, z_emb_dim, dropout),
+        self.input_blocks = nn.ModuleList([
+            nn.Conv2d(in_channels, model_channels, 3, padding=1)
         ])
+        input_block_chans = [model_channels]
+        ch = model_channels
+        ds = 1
+        for level, mult in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers = [
+                    CausalResBlock(ch, time_embed_dim, s_dim, z_dim, dropout, out_channels=mult * model_channels, use_conv=conv_resample)
+                ]
+                ch = mult * model_channels
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch))
+                self.input_blocks.append(nn.Sequential(*layers))
+                input_block_chans.append(ch)
+            if level != len(channel_mult) - 1:
+                self.input_blocks.append(Downsample(ch, use_conv=conv_resample))
+                input_block_chans.append(ch)
+                ds *= 2
 
-        # --- Upsampling Path (Decoder) ---
-        # Build the upsampling blocks of the UNet.
-        self.up_blocks = nn.ModuleList()
-        for i_level, mult in reversed(list(enumerate(ch_mult))):
-            block = nn.ModuleList()
-            out_ch = ch * mult
-            # The input channel size for the upsampling ResBlocks is doubled
-            # to account for the concatenation of the skip connection.
-            for _ in range(num_res_blocks + 1):
-                block.append(CausalResBlock(in_ch + out_ch, out_ch, time_emb_dim, s_emb_dim, z_emb_dim, dropout))
-                in_ch = out_ch
-            # Add an upsampling layer at the beginning of each level (except the first).
-            if i_level != 0:
-                block.append(nn.ConvTranspose2d(in_ch, in_ch, 3, stride=2, padding=1, output_padding=1))
-            self.up_blocks.append(block)
+        self.middle_block = nn.Sequential(
+            CausalResBlock(ch, time_embed_dim, s_dim, z_dim, dropout),
+            AttentionBlock(ch),
+            CausalResBlock(ch, time_embed_dim, s_dim, z_dim, dropout),
+        )
 
-        # --- Final Output Convolution ---
-        # Maps the final feature map back to the image channel dimension.
-        self.conv_out = conv3x3(in_ch, config.data.channels, init_scale=0.)
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in reversed(list(enumerate(channel_mult))):
+            for i in range(num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                layers = [
+                    CausalResBlock(ch + ich, time_embed_dim, s_dim, z_dim, dropout, out_channels=model_channels * mult, use_conv=conv_resample)
+                ]
+                ch = model_channels * mult
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch))
+                if level and i == num_res_blocks:
+                    layers.append(Upsample(ch, use_conv=conv_resample))
+                    ds //= 2
+                self.output_blocks.append(nn.Sequential(*layers))
 
-    def forward(self, x, t, s, z):
+        self.out = nn.Sequential(
+            nn.GroupNorm(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, out_channels, 3, padding=1),
+        )
+
+    def forward(self, x, timesteps, s, z):
         """
-        Forward pass for the CausalUNet.
-
-        Args:
-            x (torch.Tensor): The input image tensor (e.g., adversarial example).
-            t (torch.Tensor): The timestep tensor.
-            s (torch.Tensor): The causal latent factor tensor.
-            z (torch.Tensor): The non-causal latent factor tensor.
-
-        Returns:
-            torch.Tensor: The predicted velocity field for purification.
+        Apply the model to an input batch.
         """
-        # 1. Process Embeddings
-        # Get the sinusoidal time embedding and project it.
-        t_emb = get_timestep_embedding(t, self.config.model.ch)
-        t_emb = self.time_embedding(t_emb)
+        hs = []
+        emb = self.time_embed(timestep_embedding(timesteps, self.config.model_channels))
+        h = x
 
-        # 2. Downsampling Path
-        h = self.conv_in(x)
-        hs = [h] # `hs` will store feature maps for skip connections.
-        
-        for i_level, down_block_level in enumerate(self.down_blocks):
-            for i_block, block_module in enumerate(down_block_level):
-                if isinstance(block_module, CausalResBlock):
-                    h = block_module(h, t_emb, s, z)
-                else: # Downsample layer
-                    h = block_module(h)
-                # **CRITICAL LOGIC**
-                # Store the output of every ResBlock for the skip connections.
-                # The original code had a bug `hs.app` which is corrected here to `hs.append`.
-                # Without this, the skip connections would be broken.
-                if isinstance(block_module, CausalResBlock):
-                    hs.append(h)
+        # Downsampling path
+        for module in self.input_blocks:
+            if isinstance(module, nn.Sequential):
+                for layer in module:
+                    if isinstance(layer, CausalResBlock):
+                        h = layer(h, emb, s, z)
+                    else:
+                        h = layer(h)
+            else: # Handles initial Conv2d and Downsample layers
+                h = module(h)
+            # --- BUG FIX v3 ---
+            # Corrected typo from 'hs.app' to 'hs.append(h)'
+            hs.append(h)
+            # --- END BUG FIX v3 ---
 
-        # 3. Middle Block
-        for block_module in self.middle_block:
-            h = block_module(h, t_emb, s, z)
+        # Middle path
+        for layer in self.middle_block:
+            if isinstance(layer, CausalResBlock):
+                h = layer(h, emb, s, z)
+            else:
+                h = layer(h)
 
-        # 4. Upsampling Path
-        for i_level, up_block_level in enumerate(self.up_blocks):
-            for i_block, block_module in enumerate(up_block_level):
-                if isinstance(block_module, CausalResBlock):
-                    # Pop the corresponding feature map from the downsampling path.
-                    skip_h = hs.pop()
-                    # Concatenate with the skip connection feature map.
-                    h = torch.cat([h, skip_h], dim=1)
-                    h = block_module(h, t_emb, s, z)
-                else: # Upsample layer
-                    h = block_module(h)
+        # Upsampling path
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            # The upsampling blocks are also Sequential
+            for layer in module:
+                if isinstance(layer, CausalResBlock):
+                    h = layer(h, emb, s, z)
+                else:
+                    h = layer(h)
 
-        # 5. Final Output
-        h = F.swish(h)
-        out = self.conv_out(h)
-        return out
+        return self.out(h)
