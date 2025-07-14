@@ -1,21 +1,3 @@
-# training/train_purifier_gaussian.py
-# This is the FINAL, REWRITTEN training script for Stage 2.
-#
-# Key Changes:
-# 1. Architectural Compatibility: This script is now fully compatible with the new
-#    DDPM++ CausalUNet architecture.
-# 2. Correct Latent Loss Calculation: Instead of a single-step approximation, this
-#    script now uses a small, differentiable, multi-step ODE solver
-#    (`solve_ode_for_training`) to get a more accurate purified image. This provides
-#    a much higher quality and more stable gradient for the latent loss, which is
-#    the core of the causal guidance mechanism.
-# 3. Validation and Reporting: Includes a full validation loop to measure
-#    clean and robust accuracy after each epoch. It saves the model based on
-#    the best robust accuracy and logs sample images for qualitative analysis.
-#
-# CORRECTIONS APPLIED:
-# - Added a CosineAnnealingLR learning rate scheduler to stabilize training.
-
 import os
 import argparse
 import yaml
