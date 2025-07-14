@@ -1,20 +1,3 @@
-# models/causalunet.py
-# This file has been completely rewritten to use the SOTA-standard DDPM++ architecture,
-# as used in FlowPure and CausalDiff. It replaces the previous custom UNet.
-#
-# Key Changes:
-# 1. Full DDPM++ Architecture: Implements the complete multi-resolution structure
-#    with proper ResNet blocks, skip connections, and attention blocks.
-# 2. Causal Conditioning (FiLM): The `s` (causal) and `z` (style) vectors are
-#    injected into each CausalResBlock using FiLM-style modulation (scale and bias),
-#    providing robust and stable guidance to the purification process.
-# 3. Corrected Forward Pass: The forward pass now correctly handles the skip
-#    connections and passes the timestep, s, and z embeddings through all levels
-#    of the network.
-#
-# CORRECTIONS APPLIED (v3):
-# - Fixed an AttributeError typo from `hs.app` to `hs.append(h)`.
-
 import math
 import torch
 import torch.nn as nn

@@ -20,6 +20,7 @@ from modules.cfm import ConditionalFlowMatcher
 
 def get_config_and_setup(args):
     """Load configuration from YAML and set up device."""
+    # MODIFICATION: Default config path changed to the more stable version.
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
@@ -30,7 +31,7 @@ def get_config_and_setup(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config_obj.device = device
     
-    print(f"--- Purifier Training Stage 2 (with Validation) ---")
+    print(f"--- Purifier Training Stage 2 (Corrected & Stabilized) ---")
     print(f"Using device: {device}")
     
     return config_obj
@@ -56,22 +57,27 @@ def load_frozen_models(config, checkpoint_path):
     
     return encoder, latent_classifier
 
-def solve_ode(purifier_unet, s_cond, z_cond, x_start, n_steps=10):
+def solve_ode_for_inference(purifier_unet, s_cond, z_cond, x_start, n_steps=10):
     """
-    A differentiable ODE solver for use inside both training and validation.
+    A multi-step ODE solver used for VALIDATION and INFERENCE.
+    This function is NOT used in the training loop's backpropagation path.
     """
     x_t = x_start.clone()
     dt = 1.0 / n_steps
     
-    for i in range(n_steps):
-        t = torch.full((x_t.shape[0],), i * dt, device=x_t.device)
-        velocity = purifier_unet(x_t, t, s_cond, z_cond)
-        x_t = x_t + velocity * dt
-        
+    with torch.no_grad():
+        for i in range(n_steps):
+            t = torch.full((x_t.shape[0],), i * dt, device=x_t.device)
+            velocity = purifier_unet(x_t, t, s_cond, z_cond)
+            x_t = x_t + velocity * dt
+            
     return torch.clamp(x_t, 0, 1)
 
 class FullDefense(nn.Module):
-    """ A wrapper to make the defense pipeline differentiable for the attacker. """
+    """ 
+    A wrapper to make the defense pipeline differentiable for the attacker.
+    This uses a multi-step ODE solve to present a realistic attack surface.
+    """
     def __init__(self, purifier, encoder, classifier, n_steps=10):
         super().__init__()
         self.purifier = purifier
@@ -80,16 +86,27 @@ class FullDefense(nn.Module):
         self.n_steps = n_steps
 
     def forward(self, x):
+        x_t = x.clone()
+        dt = 1.0 / self.n_steps
+        
         # The attacker gets to see the initial conditioning.
-        s_cond, z_cond, _, _ = self.encoder(x)
-        x_purified = solve_ode(self.purifier, s_cond, z_cond, x, self.n_steps)
+        s_cond, z_cond, _, _ = self.encoder(x_t)
+
+        # Differentiable ODE solve for the attacker
+        for i in range(self.n_steps):
+            t = torch.full((x_t.shape[0],), i * dt, device=x_t.device)
+            velocity = self.purifier(x_t, t, s_cond, z_cond)
+            x_t = x_t + velocity * dt
+        
+        x_purified = torch.clamp(x_t, 0, 1)
         s_final, _, _, _ = self.encoder(x_purified)
         logits = self.classifier(s_final)
         return logits
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 2: Train Latent-Guided Gaussian Denoiser")
-    parser.add_argument('--config', type=str, default='configs/cifar10.yml', help='Path to the config file.')
+    parser = argparse.ArgumentParser(description="Stage 2: Train Latent-Guided Purifier (Corrected)")
+    # MODIFICATION: Default config path changed to the more stable version.
+    parser.add_argument('--config', type=str, default='configs/cifar10_causalflow.yml', help='Path to the config file.')
     parser.add_argument('--encoder_checkpoint', type=str, default='./checkpoints/causal_encoder_best.pt')
     parser.add_argument('--checkpoint_path', type=str, default='./checkpoints')
     parser.add_argument('--log_path', type=str, default='./logs')
@@ -109,49 +126,60 @@ def main():
     frozen_encoder, frozen_classifier = load_frozen_models(config, args.encoder_checkpoint)
 
     optimizer = torch.optim.Adam(purifier_unet.parameters(), lr=config.lr)
-    
-    # --- STABILITY IMPROVEMENT: Add Learning Rate Scheduler ---
     scheduler = CosineAnnealingLR(optimizer, T_max=config.joint_finetune_epochs, eta_min=1e-6)
     
     pixel_loss_fn = nn.MSELoss()
     latent_loss_fn = nn.MSELoss()
-    cfm = ConditionalFlowMatcher(sigma=0.0)
+    cfm = ConditionalFlowMatcher(sigma=0.0) # sigma=0 for rectified flow
 
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.log_path, exist_ok=True)
     
     # --- Attacker for Validation ---
+    # The attacker uses a differentiable 5-step ODE solver to approximate the defense
     attackable_defense = FullDefense(purifier_unet, frozen_encoder, frozen_classifier, n_steps=5).to(config.device)
     attack = torchattacks.PGD(attackable_defense, eps=config.attack_params['eps'], alpha=config.attack_params['alpha'], steps=10)
 
     best_robust_acc = 0.0
 
-    print("--- Starting Stage 2: Latent-Guided Denoiser Training ---")
+    print("--- Starting Stage 2: Latent-Guided Purifier Training ---")
     for epoch in range(config.joint_finetune_epochs):
         purifier_unet.train()
-        pbar = tqdm(train_loader, desc=f"[Denoiser Train Epoch {epoch+1}]")
+        pbar = tqdm(train_loader, desc=f"[Purifier Train Epoch {epoch+1}]")
         
         for i, (x_clean, _) in enumerate(pbar):
             x_clean = x_clean.to(config.device)
+            
+            # Create noisy input by adding Gaussian noise
             noise = torch.randn_like(x_clean) * config.noise_std
-            x_noisy = x_clean + noise
+            x_noisy = torch.clamp(x_clean + noise, 0, 1)
 
             optimizer.zero_grad()
 
+            # Get the target causal factors from the clean image
             with torch.no_grad():
                 s_target, z_target, _, _ = frozen_encoder(x_clean)
 
+            # Sample a time, an interpolated point xt, and the ground-truth velocity ut
             t, xt, ut = cfm.sample_location_and_conditional_flow(x0=x_noisy, x1=x_clean)
+            
+            # Predict the velocity with the UNet
             predicted_ut = purifier_unet(xt, t, s_target, z_target)
+            
+            # 1. Flow Matching Loss (Pixel-space velocity)
             flow_loss = pixel_loss_fn(predicted_ut, ut)
 
-            x_purified_estimate = solve_ode(purifier_unet, s_target, z_target, xt, n_steps=5)
-            s_denoised, _, _, _ = frozen_encoder(x_purified_estimate)
+            x_purified_approx = torch.clamp(xt + predicted_ut * dt_approx, 0, 1)
+            
+            s_denoised, _, _, _ = frozen_encoder(x_purified_approx)
             latent_loss = latent_loss_fn(s_denoised, s_target)
 
+            # Combine the losses
             total_loss = flow_loss + config.lambda_latent * latent_loss
+            
             total_loss.backward()
             
+            # Add gradient clipping for extra stability
             torch.nn.utils.clip_grad_norm_(purifier_unet.parameters(), 1.0)
             
             optimizer.step()
@@ -160,7 +188,7 @@ def main():
                 "Total Loss": f"{total_loss.item():.4f}",
                 "Flow Loss": f"{flow_loss.item():.4f}",
                 "Latent Loss": f"{latent_loss.item():.4f}",
-                "LR": f"{scheduler.get_last_lr()[0]:.6f}" # Log the learning rate
+                "LR": f"{scheduler.get_last_lr()[0]:.6f}"
             })
 
         # --- VALIDATION LOOP ---
@@ -169,35 +197,34 @@ def main():
         total_robust, correct_robust = 0, 0
         
         pbar_val = tqdm(test_loader, desc=f"[Validation Epoch {epoch+1}]")
-        tem = 0
+
         for i, (x, y) in enumerate(pbar_val):
-            if tem % 50 == 0:
-                break
-            else:
-                tem += 1
             x, y = x.to(config.device), y.to(config.device)
 
+            # Generate adversarial examples using the full differentiable defense
             x_adv = attack(x, y)
             
-            with torch.no_grad():
-                s_cond_clean, z_cond_clean, _, _ = frozen_encoder(x)
-                x_purified_clean = solve_ode(purifier_unet, s_cond_clean, z_cond_clean, x, n_steps=10)
-                s_final_clean, _, _, _ = frozen_encoder(x_purified_clean)
-                logits_clean = frozen_classifier(s_final_clean)
-                correct_clean += (logits_clean.argmax(1) == y).sum().item()
-                total_clean += y.size(0)
+            # --- Perform Purification and Classification (with no_grad) ---
+            # Clean images
+            s_cond_clean, z_cond_clean, _, _ = frozen_encoder(x)
+            x_purified_clean = solve_ode_for_inference(purifier_unet, s_cond_clean, z_cond_clean, x, n_steps=10)
+            s_final_clean, _, _, _ = frozen_encoder(x_purified_clean)
+            logits_clean = frozen_classifier(s_final_clean)
+            correct_clean += (logits_clean.argmax(1) == y).sum().item()
+            total_clean += y.size(0)
 
-                s_cond_adv, z_cond_adv, _, _ = frozen_encoder(x_adv)
-                x_purified_adv = solve_ode(purifier_unet, s_cond_adv, z_cond_adv, x_adv, n_steps=10)
-                s_final_adv, _, _, _ = frozen_encoder(x_purified_adv)
-                logits_adv = frozen_classifier(s_final_adv)
-                correct_robust += (logits_adv.argmax(1) == y).sum().item()
-                total_robust += y.size(0)
+            # Adversarial images
+            s_cond_adv, z_cond_adv, _, _ = frozen_encoder(x_adv)
+            x_purified_adv = solve_ode_for_inference(purifier_unet, s_cond_adv, z_cond_adv, x_adv, n_steps=10)
+            s_final_adv, _, _, _ = frozen_encoder(x_purified_adv)
+            logits_adv = frozen_classifier(s_final_adv)
+            correct_robust += (logits_adv.argmax(1) == y).sum().item()
+            total_robust += y.size(0)
 
-                pbar_val.set_postfix({
-                    "Clean Acc": f"{100*correct_clean/total_clean:.2f}%",
-                    "Robust Acc": f"{100*correct_robust/total_robust:.2f}%"
-                })
+            pbar_val.set_postfix({
+                "Clean Acc": f"{100*correct_clean/total_clean:.2f}%",
+                "Robust Acc": f"{100*correct_robust/total_robust:.2f}%"
+            })
 
         clean_acc = 100 * correct_clean / total_clean
         robust_acc = 100 * correct_robust / total_robust
@@ -213,19 +240,20 @@ def main():
                 'purifier_state_dict': purifier_unet.state_dict(),
             }, os.path.join(args.checkpoint_path, 'causal_purifier_best.pt'))
         
-        # Log Sample Images
+        # Log sample images for qualitative analysis
         if (epoch + 1) % 5 == 0:
             with torch.no_grad():
+                # Use the first 8 images from the last validation batch
                 sample_x = x[:8]
-                sample_x_adv = attack(sample_x, y[:8])
+                sample_y = y[:8]
+                sample_x_adv = attack(sample_x, sample_y)
                 s_cond_log, z_cond_log, _, _ = frozen_encoder(sample_x_adv)
-                sample_x_purified = solve_ode(purifier_unet, s_cond_log, z_cond_log, sample_x_adv, n_steps=10)
+                sample_x_purified = solve_ode_for_inference(purifier_unet, s_cond_log, z_cond_log, sample_x_adv, n_steps=10)
                 
                 comparison = torch.cat([sample_x.cpu(), sample_x_adv.cpu(), sample_x_purified.cpu()])
                 save_image(comparison, os.path.join(args.log_path, f'epoch_{epoch+1}_comparison.png'), nrow=8)
                 print(f"Saved sample image grid to {args.log_path}")
         
-        # --- Step the scheduler after each epoch ---
         scheduler.step()
 
     print("\n--- Stage 2 Training Complete ---")
