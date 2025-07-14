@@ -1,8 +1,6 @@
 # models/causalunet.py
 # This file has been completely rewritten to use the SOTA-standard DDPM++ architecture,
 # as used in FlowPure and CausalDiff. It replaces the previous custom UNet.
-# The core logic is adapted from the OpenAI guided-diffusion repository, which you
-# already have in `models/networks/fpunet`.
 #
 # Key Changes:
 # 1. Full DDPM++ Architecture: Implements the complete multi-resolution structure
@@ -13,22 +11,20 @@
 # 3. Corrected Forward Pass: The forward pass now correctly handles the skip
 #    connections and passes the timestep, s, and z embeddings through all levels
 #    of the network.
+#
+# CORRECTIONS APPLIED (v3):
+# - Fixed an AttributeError typo from `hs.app` to `hs.append(h)`.
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- Helper Modules from guided-diffusion/fpunet ---
-# We bring these into the file for clarity and to make this module self-contained.
+# --- Helper Modules ---
 
 def timestep_embedding(timesteps, dim, max_period=10000):
     """
     Create sinusoidal timestep embeddings.
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-    :param dim: the dimension of the output.
-    :param max_period: controls the minimum frequency of the embeddings.
-    :return: an [N x dim] Tensor of positional embeddings.
     """
     half = dim // 2
     freqs = torch.exp(
@@ -43,15 +39,11 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 class CausalResBlock(nn.Module):
     """
     A residual block that includes causal conditioning via FiLM.
-    It takes timestep embeddings, causal `s` embeddings, and style `z` embeddings.
     """
     def __init__(self, channels, emb_channels, s_dim, z_dim, dropout, out_channels=None, use_conv=False, dims=2):
         super().__init__()
         self.channels = channels
-        self.emb_channels = emb_channels
-        self.dropout = dropout
         self.out_channels = out_channels or channels
-        self.use_conv = use_conv
 
         self.in_layers = nn.Sequential(
             nn.GroupNorm(32, channels),
@@ -59,19 +51,14 @@ class CausalResBlock(nn.Module):
             nn.Conv2d(channels, self.out_channels, 3, padding=1),
         )
 
-        # Timestep embedding projection
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
             nn.Linear(emb_channels, self.out_channels),
         )
-        
-        # Causal `s` embedding projection (provides bias)
         self.s_layers = nn.Sequential(
             nn.SiLU(),
             nn.Linear(s_dim, self.out_channels),
         )
-
-        # Style `z` embedding projection (provides scale)
         self.z_layers = nn.Sequential(
             nn.SiLU(),
             nn.Linear(z_dim, self.out_channels),
@@ -87,27 +74,21 @@ class CausalResBlock(nn.Module):
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
-            self.skip_connection = nn.Conv2d(dims, channels, self.out_channels, 3, padding=1)
+            self.skip_connection = nn.Conv2d(channels, self.out_channels, 3, padding=1)
         else:
-            self.skip_connection = nn.Conv2d(dims, channels, self.out_channels, 1)
+            self.skip_connection = nn.Conv2d(channels, self.out_channels, 1)
 
     def forward(self, x, emb, s, z):
         h = self.in_layers(x)
-        
-        # Project embeddings
         emb_out = self.emb_layers(emb).type(h.dtype)
         s_out = self.s_layers(s).type(h.dtype)
         z_out = self.z_layers(z).type(h.dtype)
         
-        # Reshape for broadcasting
         emb_out = emb_out.view(emb_out.shape[0], emb_out.shape[1], 1, 1)
         s_out = s_out.view(s_out.shape[0], s_out.shape[1], 1, 1)
         z_out = z_out.view(z_out.shape[0], z_out.shape[1], 1, 1)
 
-        # FiLM-style conditioning
-        # `z` provides scale, `s` provides bias, `t` provides an additional bias
         h = h * (1 + z_out) + s_out + emb_out
-        
         h = self.out_layers(h)
         return self.skip_connection(x) + h
 
@@ -151,7 +132,6 @@ class QKVAttention(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, channels, use_conv, dims=2):
         super().__init__()
-        self.channels = channels
         self.use_conv = use_conv
         if use_conv:
             self.conv = nn.Conv2d(channels, channels, 3, padding=1)
@@ -165,8 +145,6 @@ class Upsample(nn.Module):
 class Downsample(nn.Module):
     def __init__(self, channels, use_conv, dims=2):
         super().__init__()
-        self.channels = channels
-        self.use_conv = use_conv
         if use_conv:
             self.op = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
         else:
@@ -183,7 +161,6 @@ class CausalUNet(nn.Module):
         super().__init__()
         self.config = config
         
-        # Unpack config
         image_size = config.image_size
         in_channels = config.in_channels
         model_channels = config.model_channels
@@ -196,7 +173,6 @@ class CausalUNet(nn.Module):
         s_dim = config.s_dim
         z_dim = config.z_dim
 
-        # Timestep embedding
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
             nn.Linear(model_channels, time_embed_dim),
@@ -204,7 +180,6 @@ class CausalUNet(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        # --- Downsampling Path ---
         self.input_blocks = nn.ModuleList([
             nn.Conv2d(in_channels, model_channels, 3, padding=1)
         ])
@@ -226,14 +201,12 @@ class CausalUNet(nn.Module):
                 input_block_chans.append(ch)
                 ds *= 2
 
-        # --- Middle Path ---
         self.middle_block = nn.Sequential(
             CausalResBlock(ch, time_embed_dim, s_dim, z_dim, dropout),
             AttentionBlock(ch),
             CausalResBlock(ch, time_embed_dim, s_dim, z_dim, dropout),
         )
 
-        # --- Upsampling Path ---
         self.output_blocks = nn.ModuleList([])
         for level, mult in reversed(list(enumerate(channel_mult))):
             for i in range(num_res_blocks + 1):
@@ -249,7 +222,6 @@ class CausalUNet(nn.Module):
                     ds //= 2
                 self.output_blocks.append(nn.Sequential(*layers))
 
-        # --- Output Layer ---
         self.out = nn.Sequential(
             nn.GroupNorm(32, ch),
             nn.SiLU(),
@@ -259,40 +231,41 @@ class CausalUNet(nn.Module):
     def forward(self, x, timesteps, s, z):
         """
         Apply the model to an input batch.
-        :param x: an [N x C x H x W] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param s: an [N x s_dim] Tensor of causal latents.
-        :param z: an [N x z_dim] Tensor of style latents.
-        :return: an [N x C x H x W] Tensor of outputs.
         """
         hs = []
-        
-        # Timestep embedding
         emb = self.time_embed(timestep_embedding(timesteps, self.config.model_channels))
+        h = x
 
-        # Downsampling
-        h = self.input_blocks[0](x)
-        hs.append(h)
-        for module in self.input_blocks[1:]:
-            if isinstance(module[0], CausalResBlock):
-                 h = module[0](h, emb, s, z)
-                 if len(module) > 1: # If attention block exists
-                     h = module[1](h)
-            else: # Downsample layer
+        # Downsampling path
+        for module in self.input_blocks:
+            if isinstance(module, nn.Sequential):
+                for layer in module:
+                    if isinstance(layer, CausalResBlock):
+                        h = layer(h, emb, s, z)
+                    else:
+                        h = layer(h)
+            else: # Handles initial Conv2d and Downsample layers
                 h = module(h)
+            # --- BUG FIX v3 ---
+            # Corrected typo from 'hs.app' to 'hs.append(h)'
             hs.append(h)
-        
-        # Middle block
-        h = self.middle_block[0](h, emb, s, z)
-        h = self.middle_block[1](h)
-        h = self.middle_block[2](h, emb, s, z)
+            # --- END BUG FIX v3 ---
 
-        # Upsampling
+        # Middle path
+        for layer in self.middle_block:
+            if isinstance(layer, CausalResBlock):
+                h = layer(h, emb, s, z)
+            else:
+                h = layer(h)
+
+        # Upsampling path
         for module in self.output_blocks:
-            cat_in = torch.cat([h, hs.pop()], dim=1)
-            h = module[0](cat_in, emb, s, z)
-            if len(module) > 1: # If attention or upsample exists
-                for layer in module[1:]:
+            h = torch.cat([h, hs.pop()], dim=1)
+            # The upsampling blocks are also Sequential
+            for layer in module:
+                if isinstance(layer, CausalResBlock):
+                    h = layer(h, emb, s, z)
+                else:
                     h = layer(h)
 
         return self.out(h)

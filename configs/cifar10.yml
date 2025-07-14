@@ -1,0 +1,56 @@
+# configs/cifar10.yml
+# This file has been UPDATED with a final set of stable hyperparameters.
+# It includes a separate, smaller learning rate for the CLUB estimator
+# and more conservative loss weights to ensure a balanced training dynamic.
+
+# --- Data Configuration ---
+image_size: 32
+in_channels: 3
+out_channels: 3
+num_classes: 10
+
+# --- Training Hyperparameters ---
+batch_size: 64
+lr: 0.0002  # Main learning rate for encoder/classifier
+critic_lr: 0.00005 # KEY: A smaller LR for the CLUB estimator to keep it stable.
+victim_train_epochs: 200 
+causal_pretrain_epochs: 100 
+joint_finetune_epochs: 150 
+
+# --- UNet Architecture (for the Purifier) ---
+model_channels: 128
+channel_mult: [1, 2, 2, 2]
+num_res_blocks: 2
+attention_resolutions: [16]
+dropout: 0.1
+resamp_with_conv: true
+
+# --- Causal Encoder Architecture ---
+s_dim: 128 
+z_dim: 128 
+
+# --- Victim WRN Architecture ---
+wrn_depth: 28
+wrn_widen_factor: 10
+
+# --- Loss Function Weights (Corrected for Stability) ---
+# Stage 1: CIB Loss Weights
+gamma_ce: 10.0     
+lambda_kl: 0.01    
+eta_club: 0.001   # A slightly higher but still safe weight for disentanglement.
+
+# Stage 2: Purifier Loss Weights
+lambda_latent: 10.0 
+
+# --- Defense & Attack Parameters ---
+# For Conditional Flow Matching (CFM)
+sigma: 0.01
+
+# For Gaussian Denoiser Training (Stage 2)
+noise_std: 0.5  
+
+# For PGD and AutoAttack
+attack_params:
+  eps: 0.03137254901960784 # 8/255
+  alpha: 0.00784313725490196 # 2/255
+  iters: 10 

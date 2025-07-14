@@ -51,7 +51,7 @@ def load_encoder(config, checkpoint_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize Causal Encoder Latent Space")
-    parser.add_argument('--config', type=str, default='configs/cifar10_causalflow.yml', help='Path to the config file.')
+    parser.add_argument('--config', type=str, default='configs/cifar10.yml', help='Path to the config file.')
     parser.add_argument('--encoder_checkpoint', type=str, default='checkpoints/causal_encoder_best.pt', help='Path to the trained CausalEncoder checkpoint.')
     parser.add_argument('--num_samples', type=int, default=5000, help='Number of test samples to visualize.')
     parser.add_argument('--output_file', type=str, default='latent_space_visualization.png', help='Path to save the output plot.')
@@ -90,16 +90,16 @@ def main():
 
     # --- Run t-SNE ---
     # It's recommended to run t-SNE on each latent space separately
-    tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
+    tsne = TSNE(n_components=2, verbose=1, perplexity=40)
     
     s_2d = tsne.fit_transform(all_s)
     print("t-SNE for 's' complete.")
     
-    tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
+    tsne = TSNE(n_components=2, verbose=1, perplexity=40)
     z_2d = tsne.fit_transform(all_z)
     print("t-SNE for 'z' complete.")
 
-    tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=300)
+    tsne = TSNE(n_components=2, verbose=1, perplexity=40)
     sz_2d = tsne.fit_transform(all_sz)
     print("t-SNE for '[s,z]' complete.")
 
